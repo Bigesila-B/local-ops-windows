@@ -1,0 +1,4 @@
+# Runtime remains Python-standard-library only. These packages are used solely
+# to regenerate the checked-in texture assets with tools/gen_textures.py.
+numpy==2.4.6
+Pillow==10.3.0

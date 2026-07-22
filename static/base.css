@@ -1,0 +1,88 @@
+/* ============================================================
+   主题无关的行为层
+   只承载跨主题的可访问性与窄屏布局修正；视觉令牌仍由 themes/*.css 提供。
+   ============================================================ */
+
+.field [aria-invalid="true"] {
+  border-color: var(--red) !important;
+}
+
+#logBody[aria-busy="true"],
+#appDiagList[aria-busy="true"] {
+  cursor: progress;
+}
+
+@media (hover: none) {
+  /* 触屏设备没有 hover，行操作必须始终可发现。 */
+  .tbl-body .c-act { opacity: 1; }
+}
+
+@media (max-width: 680px) {
+  /* 桌面表格在手机宽度改为信息卡；端口与危险操作始终保留。 */
+  .tbl .tr.th { display: none; }
+
+  .tbl:not(.tbl-watch) .tbl-body .tr {
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "dot title port"
+      ". load uptime"
+      ". actions actions"
+      "command command command";
+    gap: 8px 10px;
+    min-height: 0;
+    padding: 12px;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-dot { grid-area: dot; }
+  .tbl:not(.tbl-watch) .tbl-body .c-title { grid-area: title; }
+  .tbl:not(.tbl-watch) .tbl-body .c-port { grid-area: port; }
+  .tbl:not(.tbl-watch) .tbl-body .c-cwd { display: none; }
+  .tbl:not(.tbl-watch) .tbl-body .c-load {
+    grid-area: load;
+    min-width: 0;
+    flex-wrap: wrap;
+    row-gap: 3px;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-up {
+    grid-area: uptime;
+    justify-self: end;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .c-act {
+    grid-area: actions;
+    min-width: 0;
+    min-height: 32px;
+    flex-wrap: wrap;
+    opacity: 1;
+  }
+  .tbl:not(.tbl-watch) .tbl-body .tr-cmd {
+    grid-area: command;
+    grid-column: auto;
+    padding: 2px 0 0;
+  }
+
+  .tbl-watch .tbl-body .tr {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "title pid"
+      "load uptime"
+      "actions actions";
+    gap: 8px 12px;
+    min-height: 0;
+    padding: 12px;
+  }
+  .tbl-watch .tbl-body .w-title { grid-area: title; }
+  .tbl-watch .tbl-body .c-pid { grid-area: pid; }
+  .tbl-watch .tbl-body .c-load {
+    grid-area: load;
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+  .tbl-watch .tbl-body .c-up {
+    grid-area: uptime;
+    justify-self: end;
+  }
+  .tbl-watch .tbl-body .c-act {
+    grid-area: actions;
+    min-height: 32px;
+    opacity: 1;
+  }
+}
