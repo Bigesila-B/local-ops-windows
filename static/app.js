@@ -5,7 +5,7 @@
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, act, toast, state, DISCONNECTED_TEXT, notifyTaskCompletions,
   applyTheme, initThemeToggle, applyUiTheme, initThemePicker,
-  registeredThemes, currentUiTheme, trapLayerFocus,
+  registeredThemes, currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
   openLayer, closeLayer, activeLayer, closeThemePicker } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
 import { renderServices } from './js/services.js';
@@ -110,6 +110,7 @@ function poll(force = false) {
         throw error;
       }
       const data = await r.json();
+      reconcilePendingUiTheme(data);
       notifyTaskCompletions(state.data, data);
       state.data = data;
       state.lastUpdate = new Date();

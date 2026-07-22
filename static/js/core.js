@@ -299,7 +299,18 @@ export function initThemeToggle() {
 }
 
 /* ---------------- UI 主题（themes/ 注册表 + 配置持久化） ---------------- */
+let pendingPersistedUiTheme = null;
 export function registeredThemes() { return (state.data && state.data.themes) || []; }
+export function reconcilePendingUiTheme(data) {
+  if (!data || !pendingPersistedUiTheme) return data;
+  if (data.uiTheme === pendingPersistedUiTheme) {
+    pendingPersistedUiTheme = null;
+  } else {
+    /* 丢弃主题 POST 之前发出的旧轮询结果，避免成功切换后短暂闪回。 */
+    data.uiTheme = pendingPersistedUiTheme;
+  }
+  return data;
+}
 export function currentUiTheme() {
   const candidate = (state.data && state.data.uiTheme)
     || localStorage.getItem('console-ui-theme') || 'apollo';
@@ -362,6 +373,7 @@ export function applyUiTheme(name, persist = false) {
       if (persist) toast('主题不存在或已被移除');
       return false;
     }
+    if (persist) pendingPersistedUiTheme = name;
     const themeCss = $('#themeCss');
     const previous = document.documentElement.dataset.uiTheme || linkedThemeName(themeCss);
     const previousHref = themeCss.getAttribute('href') || ('/themes/' + previous + '.css');
@@ -378,6 +390,7 @@ export function applyUiTheme(name, persist = false) {
       }
       return true;
     } catch (e) {
+      if (persist && pendingPersistedUiTheme === name) pendingPersistedUiTheme = null;
       themeCss.href = previousHref;
       document.documentElement.dataset.uiTheme = previous;
       if (previousStored == null) localStorage.removeItem('console-ui-theme');
