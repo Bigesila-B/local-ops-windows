@@ -717,14 +717,29 @@ function heroCard() {
   if (heroEl) return heroEl;
   heroEl = el('div', 'app-hero');
   const title = el('div', 'hero-title');
-  title.innerHTML = '启动台<span>LAUNCHPAD</span>';
+  title.textContent = '本地指挥中心';
+  const titleEn = el('span');
+  titleEn.textContent = 'LOCAL OPS';
+  title.append(titleEn);
   const add = el('button', 'hero-add');
   add.type = 'button';
   add.textContent = '命令面板 ⌘K';
   add.addEventListener('click', () => window.__openPalette && window.__openPalette());
+  const media = el('div', 'hero-media');
+  const art = new Image();
+  art.className = 'hero-art';
+  art.src = '/assets/local-ops-bot.webp';
+  art.alt = '';
+  art.width = 1000;
+  art.height = 722;
+  art.decoding = 'async';
+  art.loading = 'lazy';
+  art.draggable = false;
+  art.setAttribute('aria-hidden', 'true');
+  media.append(art);
   const foot = el('div', 'hero-foot');
-  foot.textContent = 'CONSOLE / 总控台';
-  heroEl.append(title, add, foot);
+  foot.textContent = 'SERVICES / AUTOMATION';
+  heroEl.append(title, add, media, foot);
   return heroEl;
 }
 
