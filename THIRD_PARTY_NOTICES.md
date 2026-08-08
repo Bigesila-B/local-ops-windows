@@ -1,6 +1,8 @@
 # 第三方软件与素材声明
 
-项目自身代码使用根目录 `LICENSE` 中的保留所有权声明。该声明不覆盖下列第三方素材；对外分发前必须核对来源、版本和完整许可，并由发布负责人确认。
+项目有权许可的自有代码和文档采用根目录 `LICENSE` 中的 MIT License。MIT License 不会自动改变下列第三方素材、品牌素材或 AI 生成素材的许可状态；对外分发前必须核对来源、版本、完整许可和再分发范围，并由发布负责人确认。
+
+素材级来源、SHA-256、修改记录与发布状态见 `ASSET_PROVENANCE.md`。两份文件必须同步维护：本文件说明适用权利和上游声明，素材台账负责逐文件追溯与发布门禁。
 
 ## Lucide Icons
 
@@ -35,30 +37,13 @@ PERFORMANCE OF THIS SOFTWARE.
 
 OFL 1.1 允许字体与软件一同捆绑和再分发，前提是每份副本包含版权声明与 OFL 许可文本，且不将字体文件单独出售。上游原文见：<https://github.com/vercel/geist-font/blob/main/LICENSE.txt>。
 
-## 阿里巴巴普惠体 3.0
+## 项目图像
 
-- 位置：`static/fonts/AlibabaPuHuiTi-55.otf` 和 `static/fonts/AlibabaPuHuiTi-85.otf`
-- 版权方：阿里巴巴（中国）有限公司
-- 官方下载入口：<https://www.alibabafonts.com/>
-- 许可：阿里巴巴普惠体 3.0 专有法律声明（不是 MIT/OFL 等开源许可）
+- `static/assets/console-app-icon.png`、`brand-mark.png`、`favicon-32.png`、`favicon.ico`、`apple-touch-icon.png` 与 `总控台.app/Contents/Resources/AppIcon.icns` 来自同一套品牌方向；派生图标由 `tools/gen_brand_assets.py` 生成。
+- 上述品牌素材由项目维护者在用户选定方向后，于 2026-07-23 在 Codex 中使用 OpenAI Image Generation `image_gen` 工具定向生成。本次工具调用未暴露底层模型版本，因此在 `ASSET_PROVENANCE.md` 中标为 `REVIEW_REQUIRED`。
 
-### 外部分发前必须核验
-
-当前文件是常用字精简版 OTF，但项目内没有随文保存来源记录、官方原始文件校验值、完整法律声明，也没有足以证明“精简字体可随本软件对外分发”的授权记录。这是发布材料不完整的事实，本文件不对具体法律条款作扩张解释。
-
-正式发布前必须选择其一：
-
-1. 从官方渠道取得原始文件、完整法律声明，并由发布负责人核验捆绑分发范围；
-2. 就当前精简文件获得可留档的授权确认；
-3. 替换为许可文本明确、来源可追溯且适合捆绑分发的字体。
-
-完成后，将官方许可原文随发行包一同保留，并更新本节。
-
-## 项目图像与程序化纹理
-
-- `static/assets/deck-*.jpg` 与 `metal-brush*.jpg` 由本项目的 `tools/gen_textures.py` 生成。
-- `static/assets/logo.jpg` 在发布前需由发布负责人确认为自有作品或已获得允许再分发的授权，并将原始素材/授权凭证归档。
+首次公开发行前，发布负责人必须归档原始输出、生成主体、当次适用条款和允许随本项目再分发的书面结论。若结论不支持当前发行方式，应在发布前替换素材并同步更新来源、修改记录、SHA-256 与状态。
 
 ## 开发期工具
 
-`tools/gen_textures.py` 使用 NumPy 和 Pillow。它们只用于重新生成已入库的纹理，不随总控台运行，也不是运行时依赖。各自许可见其上游发行包。
+`tools/gen_brand_assets.py` 使用 `requirements-dev.txt` 精确锁定的 Pillow，并调用 macOS 自带的 `iconutil`；`tools/gen_icons.py` 由 vendored Lucide SVG 重新生成 `static/icons.js`。这些工具只用于重新生成已入库资源，不随总控台运行，也不是运行时依赖。更新版本时必须重新核对各自上游许可和来源记录。

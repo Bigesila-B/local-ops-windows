@@ -1,9 +1,21 @@
-Copyright (c) 2026 Laogou. All rights reserved.
+MIT License
 
-本项目当前仅授权作者本人及作者明确批准的人员，用于个人或项目内部的安装、运行、备份、审查和修改。
+Copyright (c) 2026 Laogou
 
-未经版权人事先书面许可，不得公开复制、发布、再分发、出售、出租、转授权，也不得将本项目的全部或实质性部分纳入对外提供的产品或服务。
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-本文件只覆盖项目自有代码和文档。第三方字体、图标及其他素材分别适用 `THIRD_PARTY_NOTICES.md` 所述的条款，不因本声明而改变其原始权利状态。
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-本项目按“现状”提供，不作任何明示或默示担保。
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

@@ -4,13 +4,21 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, act, toast, state, DISCONNECTED_TEXT, notifyTaskCompletions,
-  applyTheme, initThemeToggle, applyUiTheme, initThemePicker,
-  registeredThemes, currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
-  openLayer, closeLayer, activeLayer, closeThemePicker } from './js/core.js';
+  applyTheme, initThemeToggle, applyUiTheme,
+  currentUiTheme, reconcilePendingUiTheme, trapLayerFocus,
+  openLayer, closeLayer, activeLayer,
+  currentMutationEpoch, taskNotificationsEnabled, toggleTaskNotifications,
+  localServiceUrl } from './js/core.js';
 import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } from './js/launchpad.js';
-import { renderServices } from './js/services.js';
+import { renderServices, observePortDiscovery,
+  suspendPortDiscovery } from './js/services.js';
+import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
+  openSettingsCenter, closeSettingsCenter } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
-  openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs } from './js/overlays.js';
+  openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
+  openConsoleLog } from './js/overlays.js';
+import { configuredPort, actualPorts, portIsOpenable,
+  preferredOpenPort } from './js/ports.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const banner = $('#banner');
@@ -31,6 +39,10 @@ const stopConsoleIcon = $('#stopConsoleIcon');
 const stopConsoleLabel = $('#stopConsoleLabel');
 const viewLaunchpad = $('#view-launchpad');
 const viewServices = $('#view-services');
+/* 只有 data-view 的导航轨按钮参与视图切换；data-action 按钮由 widgets 代理 */
+const railBtns = [...document.querySelectorAll('.rail-btn[data-view]')];
+const sideLaunch = $('#sideLaunch');
+const sideSvc = $('#sideSvc');
 
 let firstRender = true;          // 首屏渲染（stagger 入场）
 
@@ -54,6 +66,14 @@ function applyView() {
     b.setAttribute('aria-selected', String(active));
     b.tabIndex = active ? 0 : -1;
   });
+  railBtns.forEach(b => {
+    const active = b.dataset.view === v;
+    b.classList.toggle('active', active);
+    if (active) b.setAttribute('aria-current', 'page');
+    else b.removeAttribute('aria-current');
+  });
+  sideLaunch.hidden = v !== 'launchpad';
+  sideSvc.hidden = v !== 'services';
   viewLaunchpad.classList.toggle('active', v === 'launchpad');
   viewServices.classList.toggle('active', v === 'services');
   viewLaunchpad.setAttribute('aria-hidden', String(v !== 'launchpad'));
@@ -66,6 +86,7 @@ function applyView() {
     : '实时掌握本机监听端口与进程负载');
 }
 navBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
+railBtns.forEach(b => b.addEventListener('click', () => switchView(b.dataset.view)));
 sideNav.addEventListener('keydown', e => {
   if (!['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
   e.preventDefault();
@@ -100,6 +121,7 @@ function poll(force = false) {
   }, POLL_TIMEOUT_MS);
   const run = (async () => {
     try {
+      const epochAtStart = currentMutationEpoch();
       const r = await fetch('/api/state', {
         cache: 'no-store',
         signal: controller.signal,
@@ -110,7 +132,15 @@ function poll(force = false) {
         throw error;
       }
       const data = await r.json();
+      /* 请求发出期间发生了写操作：这份快照是操作生效前的旧状态，
+         丢弃并立即补一轮，避免卡片短暂回退到旧状态。 */
+      if (epochAtStart !== currentMutationEpoch()) {
+        schedulePoll(0);
+        return;
+      }
       reconcilePendingUiTheme(data);
+      if (state.restartingFrom) suspendPortDiscovery();
+      observePortDiscovery(data);
       notifyTaskCompletions(state.data, data);
       state.data = data;
       state.lastUpdate = new Date();
@@ -120,16 +150,14 @@ function poll(force = false) {
         clearTimeout(restartDeadlineTimer);
         restartDeadlineTimer = null;
         state.restartingFrom = null;
-        state.connected = true;
-        banner.textContent = DISCONNECTED_TEXT;
-        banner.classList.remove('show');
-        banner.setAttribute('aria-hidden', 'true');
+        setConnected(true);
         toast('总控台已重新启动');
       } else if (!state.restartingFrom && !state.stopping) {
         setConnected(true);
       }
       render();
     } catch (e) {
+      suspendPortDiscovery();
       if (e && e.name !== 'AbortError') console.error('状态刷新失败', e);
       /* 页面进入后台时主动取消请求，不把它误报成断连。 */
       if (!document.hidden || timedOut) {
@@ -158,6 +186,7 @@ function schedulePoll(delay = POLL_INTERVAL_MS) {
 window.__poll = () => poll(true);   // 模块间共享轮询入口
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
+    suspendPortDiscovery();
     clearTimeout(pollTimer);
     pollTimer = null;
     if (pollController) pollController.abort();
@@ -166,13 +195,47 @@ document.addEventListener('visibilitychange', () => {
   poll(true).finally(() => schedulePoll());
 });
 
-function setConnected(ok, message = '') {
-  state.connected = ok;
-  if (!ok && !state.restartingFrom && !state.stopping) {
-    banner.textContent = message || DISCONNECTED_TEXT;
+const HEALTH_COMPONENT_NAMES = {
+  services: '服务监控',
+  watched: '关注进程',
+  apps: '启动台',
+  version: '版本',
+  config: '配置',
+};
+function stateHealthNotice(data) {
+  if (!data) return '';
+  const health = data.configHealth || {};
+  const messages = [];
+  if (data.degraded) {
+    const components = [...new Set((data.degradedReasons || [])
+      .map(item => HEALTH_COMPONENT_NAMES[item && item.component] || '部分组件'))];
+    messages.push('降级运行：' + (components.length ? components.join('、') : '部分组件') +
+      '数据可能不完整');
   }
-  banner.classList.toggle('show', !ok);
-  banner.setAttribute('aria-hidden', String(ok));
+  if (health.writable === false) {
+    messages.push('配置处于只读保护，修改不会保存');
+  } else if (health.recoveredFromBackup) {
+    messages.push('配置已从备份恢复，请核对内容');
+  }
+  if (health.migratedFromSchema != null) {
+    messages.push('配置已从旧版本升级');
+  }
+  return messages.length ? messages.join('；') + '。' : '';
+}
+function setConnected(ok, message = '') {
+  if (!ok) {
+    if (!state.restartingFrom && !state.stopping) {
+      banner.textContent = message || DISCONNECTED_TEXT;
+    }
+    banner.classList.add('show');
+    banner.setAttribute('aria-hidden', 'false');
+    return;
+  }
+  if (state.restartingFrom || state.stopping) return;
+  const notice = stateHealthNotice(state.data);
+  banner.textContent = notice || DISCONNECTED_TEXT;
+  banner.classList.toggle('show', !!notice);
+  banner.setAttribute('aria-hidden', String(!notice));
 }
 function render() {
   if (!state.data) return;
@@ -203,6 +266,7 @@ function render() {
   applyUiTheme(currentUiTheme());
   renderLaunchpad(state.data.apps || [], firstRender);
   renderServices(state.data, firstRender);
+  renderWidgets(state.data);
   firstRender = false;
 }
 
@@ -232,8 +296,8 @@ restartConsoleBtn.addEventListener('click', () => {
     okText: '重新启动',
     tone: 'primary',
     onOk: async () => {
+      suspendPortDiscovery();
       state.restartingFrom = consolePid;
-      state.connected = false;
       banner.textContent = '总控台正在重新启动，页面会自动恢复…';
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
@@ -272,7 +336,6 @@ stopConsoleBtn.addEventListener('click', () => {
     okText: '停止运行',
     onOk: async () => {
       state.stopping = true;
-      state.connected = false;
       banner.textContent = '总控台正在停止…再次启动请双击“总控台.app”。';
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
@@ -297,25 +360,66 @@ const paletteList = $('#paletteList');
 let paletteSel = 0;
 let paletteItems = [];
 
+function appPortHint(app) {
+  const configured = configuredPort(app);
+  const actual = actualPorts(app);
+  if (app && app.running && configured && app.listening === false && actual.length) {
+    return ':' + actual[0] + '（实际）';
+  }
+  const port = configured || actual[0];
+  return port ? ':' + port : '服务';
+}
+/* 与 portIsOpenable 语义一致：仅运行中且确实存在可用端口时可打开。 */
+function openableAppPort(app) {
+  return app && app.running && portIsOpenable(app)
+    ? preferredOpenPort(app) : null;
+}
+
 function paletteActions() {
-  const items = [];
+  const items = [
+    {
+      icon: 'plus',
+      title: '添加服务',
+      hint: '启动台 · 选择项目',
+      run: () => {
+        switchView('launchpad');
+        openAppModal(null, 'service');
+      },
+    },
+    {
+      icon: 'file-text',
+      title: '添加批处理任务',
+      hint: '启动台 · 选择脚本',
+      run: () => {
+        switchView('launchpad');
+        openAppModal(null, 'task');
+      },
+    },
+  ];
   const apps = (state.data && state.data.apps) || [];
   for (const a of apps) {
     const running = !!a.running;
     const isTask = (a.kind || 'service') === 'task';
-    const port = a.port || (a.ports && a.ports[0]);
+    const port = openableAppPort(a);
     const name = a.name || '未命名';
     items.push({
       icon: running ? 'square' : 'play',
-      title: (running ? '停止 ' : (isTask ? '运行 ' : '启动 ')) + name,
-      hint: isTask ? '任务' : (port ? ':' + port : '服务'),
+      title: (running ? (isTask ? '中止 ' : '停止 ')
+        : (isTask ? '运行 ' : '启动 ')) + name,
+      hint: isTask ? '任务' : appPortHint(a),
       on: running,
       run: () => toggleApp(a.id),
     });
+    if (running && !isTask) {
+      items.push({
+        icon: 'refresh-cw', title: '重启 ' + name, hint: '重新启动', on: true,
+        run: () => act(post('/api/apps/' + a.id + '/restart', {})),
+      });
+    }
     if (running && port) {
       items.push({
         icon: 'arrow-up-right', title: '打开 ' + name, hint: ':' + port, on: true,
-        run: () => window.open('http://127.0.0.1:' + port, '_blank', 'noopener,noreferrer'),
+        run: () => window.open(localServiceUrl(a, port), '_blank', 'noopener,noreferrer'),
       });
     }
     items.push({ icon: 'file-text', title: '查看日志 · ' + name, hint: '日志', on: running, run: () => openLogs(a) });
@@ -323,17 +427,32 @@ function paletteActions() {
   }
   items.push({ icon: 'layout-grid', title: '切换到启动台', hint: '视图', run: () => switchView('launchpad') });
   items.push({ icon: 'activity', title: '切换到服务监控', hint: '视图', run: () => switchView('services') });
-  for (const t of registeredThemes()) {
-    if (t.id === currentUiTheme()) continue;
-    items.push({
-      icon: 'sliders-horizontal',
-      title: '切换到 ' + t.name,
-      hint: '主题',
-      run: async () => {
-        if (await applyUiTheme(t.id, true)) toast('已切换到 ' + t.name);
-      },
-    });
-  }
+  items.push({
+    icon: 'file-text',
+    title: '打开日志中心',
+    hint: '日志 · ⌘J',
+    run: openLogsCenter,
+  });
+  items.push({
+    icon: 'settings',
+    title: '打开设置中心',
+    hint: '通知 · 外观 · 版本',
+    run: openSettingsCenter,
+  });
+  const notifyOn = taskNotificationsEnabled();
+  items.push({
+    icon: 'clock',
+    title: '任务完成通知：' + (notifyOn ? '开' : '关'),
+    hint: '系统通知 · 页面切走后也能收到',
+    on: notifyOn,
+    run: toggleTaskNotifications,
+  });
+  items.push({
+    icon: 'terminal',
+    title: '总控台日志',
+    hint: '系统 · data/logs/console.log',
+    run: openConsoleLog,
+  });
   return items;
 }
 
@@ -357,6 +476,8 @@ function renderPalette() {
   items.forEach((it, i) => {
     const row = el('button', 'pi' + (i === paletteSel ? ' sel' : ''));
     row.type = 'button';
+    /* 焦点停留在 combobox，由 aria-activedescendant 表示当前选项。 */
+    row.tabIndex = -1;
     row.setAttribute('role', 'option');
     row.id = 'palette-option-' + i;
     row.setAttribute('aria-selected', String(i === paletteSel));
@@ -442,6 +563,14 @@ document.addEventListener('keydown', e => {
     else if (!activeLayer()) openPalette();
   }
 });
+/* ⌘J / Ctrl+J 呼出日志中心（⌘L 是浏览器地址栏保留键，无法拦截） */
+document.addEventListener('keydown', e => {
+  if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
+    e.preventDefault();
+    if ($('#logsMask').classList.contains('open')) closeLogsCenter();
+    else if (!activeLayer()) openLogsCenter();
+  }
+});
 window.__openPalette = openPalette;   // hero 卡等跨模块入口
 
 /* Esc 逐层关闭浮层 */
@@ -449,7 +578,8 @@ document.addEventListener('keydown', e => {
   trapLayerFocus(e);
   if (e.key === 'Escape') {
     if ($('#confirmMask').classList.contains('open')) closeConfirm();
-    else if ($('#themeMask').classList.contains('open')) closeThemePicker();
+    else if ($('#logsMask').classList.contains('open')) closeLogsCenter();
+    else if ($('#settingsMask').classList.contains('open')) closeSettingsCenter();
     else if ($('#portDiagMask').classList.contains('open')) closePortDiagnostic();
     else if ($('#appDiagMask').classList.contains('open')) closeAppDiagnosis();
     else if ($('#appModalMask').classList.contains('open')) closeAppModal();
@@ -465,13 +595,15 @@ setChildren(restartConsoleIcon, icon('refresh-cw', 14));
 setChildren(stopConsoleIcon, icon('power', 14));
 setChildren($('#navIconLaunch'), icon('layout-grid', 15));
 setChildren($('#navIconSvc'), icon('activity', 15));
+setChildren($('#railIconLaunch'), icon('rocket', 19));
+setChildren($('#railIconSvc'), icon('activity', 19));
 setChildren($('#cmdkIcon'), icon('search', 14));
 setChildren($('#paletteIcon'), icon('search', 15));
 buildGlyphGrid();
 initAppModal({ onAddService: $('#addSvcCard'), onAddTask: $('#addTaskCard') });
 initLogDrawer();
 initThemeToggle();
-initThemePicker();
+initWidgets();
 applyTheme();
 applyUiTheme(currentUiTheme());
 applyView();

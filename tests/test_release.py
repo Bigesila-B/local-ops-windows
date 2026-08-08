@@ -7,6 +7,7 @@ from unittest import mock
 import zipfile
 
 from tools import build_release as release
+from tools import check_project as project_check
 
 
 class ReleaseFixtureTests(unittest.TestCase):
@@ -166,6 +167,17 @@ class ReleaseFixtureTests(unittest.TestCase):
 
 
 class ProjectReleaseManifestTests(unittest.TestCase):
+    def test_required_open_source_documents_are_in_payload(self):
+        names = {
+            path.relative_to(release.ROOT).as_posix()
+            for path in release.iter_release_files()
+        }
+        for required in release.REQUIRED_PROJECT_DOCS:
+            with self.subTest(required=required):
+                self.assertIn(required, names)
+        self.assertIn("docs/screenshots/ops-launchpad.jpg", names)
+        self.assertIn("docs/screenshots/ops-services.jpg", names)
+
     def test_required_third_party_licenses_are_in_payload(self):
         names = {
             path.relative_to(release.ROOT).as_posix()
@@ -173,6 +185,36 @@ class ProjectReleaseManifestTests(unittest.TestCase):
         }
         self.assertIn("licenses/Geist-OFL-1.1.txt", names)
         self.assertIn("licenses/Lucide-LICENSE.txt", names)
+
+
+class AssetProvenanceGateTests(unittest.TestCase):
+    def write_provenance(self, text):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "ASSET_PROVENANCE.md").write_text(text, encoding="utf-8")
+        return root
+
+    def test_blocked_or_replacement_asset_prevents_release(self):
+        root = self.write_provenance(
+            "### Logo\n- 状态：`TO_REPLACE`\n"
+            "### Illustration\n- 状态：`BLOCKED`\n"
+        )
+        with mock.patch.object(project_check, "ROOT", root):
+            with self.assertRaisesRegex(
+                project_check.CheckError,
+                "Logo=TO_REPLACE.*Illustration=BLOCKED",
+            ):
+                project_check.check_asset_release_status()
+
+    def test_review_required_asset_is_left_for_manual_release_decision(self):
+        root = self.write_provenance(
+            "### Icons\n- 状态：`CLEARED`\n"
+            "### Font\n- 状态：`REVIEW_REQUIRED`\n"
+        )
+        with mock.patch.object(project_check, "ROOT", root):
+            result = project_check.check_asset_release_status()
+        self.assertIn("2 项素材", result)
 
 
 if __name__ == "__main__":

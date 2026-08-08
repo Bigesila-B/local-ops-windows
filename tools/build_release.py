@@ -27,19 +27,27 @@ REQUIRED_LICENSES = (
     "licenses/Geist-OFL-1.1.txt",
     "licenses/Lucide-LICENSE.txt",
 )
-INCLUDE = (
-    "VERSION",
+REQUIRED_PROJECT_DOCS = (
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
-    "licenses",
-    *REQUIRED_LICENSES,
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "ASSET_PROVENANCE.md",
     "THIRD_PARTY_NOTICES.md",
     "RELEASE_CHECKLIST.md",
+)
+INCLUDE = (
+    "VERSION",
+    *REQUIRED_PROJECT_DOCS,
+    "licenses",
+    *REQUIRED_LICENSES,
     "server.py",
     "start.command",
     "总控台.app",
     "static",
+    "docs",
     "tests",
     "tools",
     "requirements-dev.txt",

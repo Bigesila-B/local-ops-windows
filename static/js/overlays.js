@@ -19,6 +19,7 @@ const glyphGrid = $('#glyphGrid');
 const iconPreview = $('#iconPreview');
 const iconPreviewImg = $('#iconPreviewImg'), iconPreviewGlyph = $('#iconPreviewGlyph');
 const iconPreviewTxt = $('#iconPreviewTxt');
+const appearanceDetails = $('#appearanceDetails'), appearanceChevron = $('#appearanceChevron');
 const appCancel = $('#appCancel'), appSave = $('#appSave');
 const appStopEdit = $('#appStopEdit'), editRunningNotice = $('#editRunningNotice');
 
@@ -31,8 +32,21 @@ const drawerTitle = $('#drawerTitle'), drawerClose = $('#drawerClose');
 const logBody = $('#logBody'), logPre = $('#logPre');
 
 const iconVer = new Map();   // appId → 图标版本号，上传/删除后刷新浏览器缓存
+setChildren(appearanceChevron, icon('chevron-down', 16));
 export function bumpIconVer(id) { iconVer.set(id, (iconVer.get(id) || 0) + 1); }
 export function getIconVer(id) { return iconVer.get(id) || 0; }
+
+/* 兼容尚未重启的旧后端；新后端会返回经过同样规则生成的 command。 */
+function shellQuotePath(path) {
+  return "'" + String(path).replace(/'/g, "'\"'\"'") + "'";
+}
+function fallbackScriptCommand(path) {
+  const quoted = shellQuotePath(path);
+  const suffix = (String(path).match(/(\.[^./]+)$/) || [])[1]?.toLowerCase();
+  if (suffix === '.py') return 'python3 -- ' + quoted;
+  if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
+  return '/bin/bash -- ' + quoted;
+}
 
 /* ============================================================
    确认模态
@@ -87,6 +101,8 @@ let appSaving = false;
 let pendingIcon = null;      // { blob, type, url }
 let selectedGlyph = null;    // 选中的 Lucide 图标名
 let removeStoredIcon = false; // 仅在保存成功后删除，取消编辑不触碰后端
+let pendingAttach = null;     // 从服务监控添加时待认领的来源进程信息
+let detectingProject = false; // 认领流程必须等项目命令识别完成后再允许保存
 
 export function buildGlyphGrid() {
   GLYPHS.forEach(g => {
@@ -172,6 +188,7 @@ function readPortValue() {
 
 function resetDetection(clearAutoPort = false) {
   detectRequestSeq += 1;
+  detectingProject = false;
   if (clearAutoPort && detectedPortValue != null &&
       fPort.value.trim() === String(detectedPortValue)) fPort.value = '';
   detectedPortValue = null;
@@ -196,17 +213,25 @@ function modalLifecycleChanged() {
 function refreshEditSaveMode() {
   const running = !!(editingAppOriginal && editingAppOriginal.running);
   const needsStop = running && modalLifecycleChanged();
+  const isTask = modalKind === 'task';
+  const stopVerb = isTask ? '中止任务' : '停止服务';
   editRunningNotice.hidden = !running;
   if (running) {
     setText(editRunningNotice, needsStop
-      ? '修改内容已保留。请先停止服务，再继续保存。'
-      : '服务正在运行。可在这里先停止服务，编辑面板不会关闭，当前填写内容也不会丢失。');
+      ? '修改内容已保留。请先' + stopVerb + '，再继续保存。'
+      : (isTask ? '任务' : '服务') + '正在运行。可在这里先' + stopVerb +
+        '，编辑面板不会关闭，当前填写内容也不会丢失。');
   }
+  setText(appStopEdit, stopVerb);
   appStopEdit.hidden = !running;
   appStopEdit.disabled = appSaving;
   appSave.hidden = false;
-  appSave.disabled = appSaving || needsStop;
-  appSave.title = needsStop ? '请先在当前面板停止服务' : '';
+  const willAttach = !editingAppId && pendingAttach && modalKind === 'service'
+    && readPortValue() === pendingAttach.port;
+  setText(appSave, willAttach ? '保存并认领' : '保存');
+  appSave.disabled = appSaving || needsStop || (willAttach && detectingProject);
+  appSave.title = needsStop ? '请先在当前面板' + stopVerb
+    : (willAttach && detectingProject ? '正在识别可靠的项目启动命令' : '');
 }
 
 function setModalKind(kind) {
@@ -219,6 +244,10 @@ function setModalKind(kind) {
   portField.hidden = modalKind === 'task';
   fPort.disabled = modalKind === 'task';
   setText(fCmdLabel, modalKind === 'task' ? '执行命令' : '启动命令');
+  fName.placeholder = modalKind === 'task' ? '如：每日备份' : '如：本地博客';
+  fCmd.placeholder = modalKind === 'task'
+    ? '选择脚本后自动生成执行命令，也可以手动填写'
+    : '选择项目后自动识别启动命令，也可以手动填写';
   appModalTitle.textContent = (editingAppId ? '编辑' : '添加') +
     (modalKind === 'task' ? '批处理任务' : '服务');
   refreshEditSaveMode();
@@ -226,8 +255,17 @@ function setModalKind(kind) {
 kindRow.querySelectorAll('.kind-btn').forEach(b =>
   b.addEventListener('click', () => setModalKind(b.dataset.kind)));
 
-export function openAppModal(app, presetKind) {
+export function openAppModal(app, presetKind, focusAction = '') {
   editingAppId = app ? app.id : null;
+  pendingAttach = !editingAppId && app && Number.isInteger(app.attachPid)
+    && app.attachPid > 0 && Number.isInteger(Number(app.port))
+    ? {
+        pid: app.attachPid,
+        port: Number(app.port),
+        instanceKey: app.attachInstanceKey || null,
+        command: (app.command || '').trim(),
+      }
+    : null;
   editingAppOriginal = app ? {
     command: app.command || '', cwd: app.cwd || null,
     port: app.port == null ? null : app.port,
@@ -243,9 +281,17 @@ export function openAppModal(app, presetKind) {
   fPort.value = app && app.port != null ? app.port : '';
   [fName, fCmd, fCwd, fPort].forEach(clearFieldError);
   setModalKind(presetKind || (app && app.kind) || 'service');
+  appearanceDetails.open = !!(app && (app.icon || app.glyph));
   syncGlyphGrid();
   renderIconPreview();
-  openLayer(appModalMask, fName);
+  const focusTarget = focusAction === 'pick-script' ? btnPickScript
+    : focusAction === 'pick-cwd' ? btnPickCwd
+      : focusAction === 'edit-command' ? fCmd
+        : app ? fName : (modalKind === 'task' ? btnPickScript : btnPickCwd);
+  openLayer(appModalMask, focusTarget);
+  /* 监听进程的 argv 往往只是框架子进程（如 next-server），不一定适合作为
+     下次启动命令。打开认领表单时同时读取项目配置，让用户选择可靠命令。 */
+  if (pendingAttach && fCwd.value.trim()) detectProject();
 }
 export function closeAppModal() {
   closeLayer(appModalMask);
@@ -255,6 +301,7 @@ export function closeAppModal() {
   clearPendingIcon();
   selectedGlyph = null;
   removeStoredIcon = false;
+  pendingAttach = null;
 }
 
 function applyDetectedCandidate(candidate, option) {
@@ -294,7 +341,7 @@ function renderDetection(result) {
   if (!candidates.length) {
     detectSummary.textContent = '没有识别到可直接启动的配置';
     const empty = el('p', 'detect-empty');
-    empty.textContent = '仍可使用“选择脚本”，或手动填写启动命令。';
+    empty.textContent = '仍可选择脚本，系统会按文件类型生成执行命令；也可以手动填写。';
     detectList.appendChild(empty);
     return;
   }
@@ -342,6 +389,8 @@ async function detectProject() {
   detectList.replaceChildren();
   btnDetectProject.disabled = true;
   btnPickCwd.disabled = true;
+  detectingProject = true;
+  refreshEditSaveMode();
   try {
     const result = await act(post('/api/project/detect', { cwd }));
     if (requestSeq !== detectRequestSeq) return;
@@ -354,10 +403,22 @@ async function detectProject() {
       renderIconPreview();
     }
     renderDetection(result);
+    if (pendingAttach && !editingAppId &&
+        fCmd.value.trim() === pendingAttach.command) {
+      const candidates = Array.isArray(result.candidates) ? result.candidates : [];
+      const index = candidates.findIndex(candidate =>
+        candidate.kind !== 'task' && Number(candidate.port) === pendingAttach.port);
+      if (index >= 0) {
+        const option = detectList.querySelectorAll('.detect-option')[index];
+        applyDetectedCandidate(candidates[index], option);
+      }
+    }
   } finally {
     if (requestSeq === detectRequestSeq) {
+      detectingProject = false;
       btnDetectProject.disabled = false;
       btnPickCwd.disabled = false;
+      refreshEditSaveMode();
     }
   }
 }
@@ -377,14 +438,15 @@ async function stopEditingApp() {
   if (!editingAppId || !editingAppOriginal || !editingAppOriginal.running) return;
   appSaving = true;
   refreshEditSaveMode();
-  toast('正在停止服务，编辑内容会保留…');
+  const isTask = modalKind === 'task';
+  toast((isTask ? '正在中止任务' : '正在停止服务') + '，编辑内容会保留…');
   try {
     const result = await act(post('/api/apps/' + editingAppId + '/stop'));
     await window.__poll();
     const latest = findApp(editingAppId);
     if ((result && result.ok !== false) || (latest && !latest.running)) {
       editingAppOriginal.running = false;
-      toast('服务已停止，可以继续编辑并保存');
+      toast((isTask ? '任务已中止' : '服务已停止') + '，可以继续编辑并保存');
     }
   } finally {
     appSaving = false;
@@ -408,7 +470,8 @@ async function saveApp() {
   const name = fName.value.trim();
   const command = fCmd.value.trim();
   if (!name) return fieldError(fName, '请填写名称');
-  if (!command) return fieldError(fCmd, '请填写启动命令');
+  if (!command) return fieldError(
+    fCmd, modalKind === 'task' ? '请填写执行命令' : '请填写启动命令');
   const port = modalKind === 'task' ? null : readPortValue();
   if (Number.isNaN(port)) return fieldError(fPort, '端口必须是 1–65535 之间的整数');
   const body = {
@@ -419,6 +482,10 @@ async function saveApp() {
     glyph: selectedGlyph || null,
     kind: modalKind,
   };
+  const wasCreating = !editingAppId;
+  const attachRequest = wasCreating && pendingAttach && modalKind === 'service'
+    && port === pendingAttach.port ? { ...pendingAttach } : null;
+  if (attachRequest) body.attachPid = attachRequest.pid;
   appSaving = true;
   refreshEditSaveMode();
   try {
@@ -433,7 +500,16 @@ async function saveApp() {
       return;
     }
     const id = app.id || editingAppId;
-    rememberSavedApp(app, id, body);
+    const attachSucceeded = !!(attachRequest && app.attached);
+    if (attachSucceeded && app.cwd) {
+      body.cwd = app.cwd;
+      fCwd.value = app.cwd;
+    }
+    rememberSavedApp(
+      attachSucceeded ? { ...app, running: true } : app,
+      id,
+      body,
+    );
     if (pendingIcon && id) {
       try {
         const r = await fetch('/api/apps/' + id + '/icon', {
@@ -464,7 +540,8 @@ async function saveApp() {
       bumpIconVer(id);
     }
     closeAppModal();
-    window.__poll();
+    await window.__poll();
+    if (attachSucceeded) toast('已加入启动台并认领正在运行的进程');
   } finally {
     appSaving = false;
     refreshEditSaveMode();
@@ -486,7 +563,7 @@ export function initAppModal({ onAddService, onAddTask }) {
       const r = await act(post('/api/pick', { what: 'script' }));
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
       const p = r.path;
-      fCmd.value = 'bash "' + p + '"';
+      fCmd.value = r.command || fallbackScriptCommand(p);
       const dir = p.slice(0, p.lastIndexOf('/'));
       if (dir && !fCwd.value.trim()) fCwd.value = dir;
       if (!fName.value.trim()) {
@@ -499,6 +576,7 @@ export function initAppModal({ onAddService, onAddTask }) {
         node.classList.remove('selected');
         node.setAttribute('aria-pressed', 'false');
       });
+      toast('已按脚本类型生成执行命令');
     } finally {
       btnPickScript.disabled = false;
     }
@@ -579,25 +657,38 @@ let logTimer = null;
 let logAppId = null;
 let logRequestSeq = 0;
 let logController = null;
+let logIsConsole = false;
+
+function logEndpoint(appId) {
+  return logIsConsole ? '/api/console/log?tail=300'
+    : '/api/apps/' + appId + '/logs?tail=300';
+}
 
 export function openLogs(app) {
+  openLogDrawer(app.id, (app.name || '') + ' · 日志');
+}
+export function openConsoleLog() {
+  openLogDrawer('console', '总控台 · 日志');
+}
+function openLogDrawer(appId, title) {
   closeLogs();
-  logAppId = app.id;
+  logAppId = appId;
+  logIsConsole = appId === 'console';
   const requestSeq = ++logRequestSeq;
-  drawerTitle.textContent = (app.name || '') + ' · 日志';
+  drawerTitle.textContent = title;
   logPre.textContent = '加载中…';
   logBody.setAttribute('aria-busy', 'true');
   openLayer(logDrawer, drawerClose);
   drawerMask.classList.add('open');
   drawerMask.setAttribute('aria-hidden', 'false');
-  fetchLogs(app.id, requestSeq);
+  fetchLogs(appId, requestSeq);
 }
 async function fetchLogs(appId, requestSeq) {
   if (!logAppId || logAppId !== appId || requestSeq !== logRequestSeq) return;
   const controller = new AbortController();
   logController = controller;
   try {
-    const r = await fetch('/api/apps/' + appId + '/logs?tail=300', {
+    const r = await fetch(logEndpoint(appId), {
       cache: 'no-store',
       signal: controller.signal,
     });
@@ -607,7 +698,14 @@ async function fetchLogs(appId, requestSeq) {
     const firstLoad = logPre.textContent === '加载中…';
     const nearBottom = firstLoad ||
       logBody.scrollHeight - logBody.scrollTop - logBody.clientHeight < 48;
-    logPre.textContent = j.text || '';
+    const text = j.text || '';
+    /* 增量追加新行：全量重写会打断用户选区并让滚动位置漂移。 */
+    const previous = firstLoad ? '' : logPre.textContent;
+    if (previous && text.startsWith(previous)) {
+      logPre.append(document.createTextNode(text.slice(previous.length)));
+    } else {
+      logPre.textContent = text;
+    }
     logBody.setAttribute('aria-busy', 'false');
     if (nearBottom) requestAnimationFrame(() => {
       if (logAppId === appId && requestSeq === logRequestSeq) {

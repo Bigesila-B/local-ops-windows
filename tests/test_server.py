@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -24,6 +25,228 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(server.validate_port(None), (None, None))
         self.assertIsNotNone(server.validate_port(True)[1])
         self.assertIsNotNone(server.validate_port(70000)[1])
+
+    def test_listener_scan_preserves_ipv6_loopback_for_open_links(self):
+        output = """COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME
+node 101 user 1u IPv6 0x0 0t0 TCP [::1]:5173 (LISTEN)
+node 202 user 2u IPv4 0x0 0t0 TCP 127.0.0.1:8000 (LISTEN)
+node 303 user 3u IPv6 0x0 0t0 TCP *:3000 (LISTEN)
+"""
+        with mock.patch.object(server, "run_cmd", return_value=output):
+            listeners = server.scan_listeners()
+
+        self.assertEqual(listeners[(101, 5173)], {"::1"})
+        self.assertEqual(
+            server.listener_open_host(listeners, 5173, {101}), "localhost")
+        self.assertEqual(
+            server.listener_open_host(listeners, 8000, {202}), "127.0.0.1")
+        self.assertEqual(
+            server.listener_open_host(listeners, 3000, {303}), "127.0.0.1")
+
+
+class OriginAttributionTests(unittest.TestCase):
+    """attribute_origin：沿 PPID 链识别 AI 助手 / 编辑器 / 终端 / 总控台。"""
+
+    @staticmethod
+    def table(*rows):
+        # rows: (pid, ppid, args)
+        return {pid: (ppid, args) for pid, ppid, args in rows}
+
+    def test_codex_chain_skips_shells_and_package_managers(self):
+        table = self.table(
+            (100, 90, "node server.mjs --open"),
+            (90, 80, "node npm exec"),
+            (80, 70, "pnpm dev"),
+            (70, 60, "-zsh"),
+            (60, 1, "/usr/local/bin/codex"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "Codex", "icon": "bot"})
+
+    def test_vscode_bundle_is_named_and_uses_code_icon(self):
+        table = self.table(
+            (100, 90, "python3 -m http.server 8000"),
+            (90, 80, "-zsh"),
+            (80, 1, "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "VS Code", "icon": "code"})
+
+    def test_iterm_bundle_uses_terminal_icon(self):
+        table = self.table(
+            (100, 90, "-zsh"),
+            (90, 1, "/Applications/iTerm.app/Contents/MacOS/iTerm2"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "iTerm", "icon": "terminal"})
+
+    def test_console_run_token_marks_console_as_origin(self):
+        table = self.table(
+            (100, 90, "python3 -m http.server 8377"),
+            (90, 1, "/bin/bash -c outer console-run:tok123 inner"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "总控台", "icon": "rocket"})
+
+    def test_unknown_middle_process_is_named_honestly(self):
+        table = self.table(
+            (100, 90, "node server.js"),
+            (90, 1, "/opt/homebrew/bin/mise run dev"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "mise", "icon": "package"})
+
+    def test_launchd_parent_reports_system(self):
+        table = self.table(
+            (100, 90, "redis-server"),
+            (90, 1, "launchd"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "系统", "icon": "server"})
+
+    def test_missing_parent_returns_none(self):
+        self.assertIsNone(server.attribute_origin(100, {}))
+
+    def test_cycle_terminates_safely(self):
+        table = self.table(
+            (100, 90, "a"),
+            (90, 100, "b"),
+        )
+        # 环会在 visited 集合处终止；最近的未识别进程作为兜底答案
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "b", "icon": "package"})
+
+    def test_unknown_wrapper_does_not_hide_the_real_agent(self):
+        # 未识别的中间层继续上爬，优先报告真正的 AI 助手
+        table = self.table(
+            (100, 90, "node server.js"),
+            (90, 80, "/opt/homebrew/bin/mise run dev"),
+            (80, 1, "/usr/local/bin/claude"),
+        )
+        origin = server.attribute_origin(100, table)
+        self.assertEqual(origin, {"label": "Claude Code", "icon": "bot"})
+
+
+class ScriptCommandTests(unittest.TestCase):
+    def test_script_extensions_choose_the_expected_runtime_and_quote_paths(self):
+        cases = {
+            ".py": "python3",
+            ".zsh": "/bin/zsh",
+            ".sh": "/bin/bash",
+            ".bash": "/bin/bash",
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for suffix, runner in cases.items():
+                with self.subTest(suffix=suffix):
+                    path = os.path.join(td, "job's file" + suffix)
+                    with open(path, "w", encoding="utf-8") as handle:
+                        handle.write("echo ok\n")
+                    parts = shlex.split(server.command_for_script(path))
+                    self.assertEqual(parts, [runner, "--", path])
+
+    def test_executable_command_is_invoked_directly(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "nightly job.command")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("#!/bin/zsh\necho ok\n")
+            os.chmod(path, 0o700)
+            self.assertEqual(
+                shlex.split(server.command_for_script(path)), [path])
+
+    def test_non_executable_command_uses_bash(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "nightly job.command")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("echo ok\n")
+            os.chmod(path, 0o600)
+            self.assertEqual(
+                shlex.split(server.command_for_script(path)),
+                ["/bin/bash", "--", path])
+
+
+class AppHealthTests(unittest.TestCase):
+    def test_python_script_with_spaces_is_checked_without_running_it(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "daily task.py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("raise RuntimeError('must not execute')\n")
+            app = {"id": "deadbeef", "kind": "task", "cwd": td,
+                   "command": server.command_for_script(path)}
+            self.assertEqual(server.inspect_app_health(app)["status"], "ok")
+            os.unlink(path)
+            health = server.inspect_app_health(app)
+
+        self.assertTrue(health["blocking"])
+        self.assertEqual(health["issues"][0]["kind"], "script-missing")
+        self.assertEqual(health["issues"][0]["action"], "pick-script")
+
+    def test_relative_script_uses_configured_working_directory(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "job.sh")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("echo ok\n")
+            app = {"command": "/bin/bash -- job.sh", "cwd": td}
+            self.assertFalse(server.inspect_app_health(app)["blocking"])
+
+    def test_missing_cwd_does_not_cascade_for_relative_script(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "gone")
+            health = server.inspect_app_health({
+                "command": "/bin/bash -- job.sh", "cwd": missing})
+        self.assertEqual([item["kind"] for item in health["issues"]],
+                         ["cwd-missing"])
+
+    def test_complex_or_dynamic_command_is_unknown_and_not_blocked(self):
+        for command in ("python3 job.py && echo done", "python3 '$JOB'",
+                        "python3 'unterminated"):
+            with self.subTest(command=command):
+                health = server.inspect_app_health(
+                    {"command": command, "cwd": None})
+                self.assertEqual(health["status"], "unknown")
+                self.assertFalse(health["blocking"])
+
+    def test_python_module_and_inline_code_are_not_treated_as_files(self):
+        for command in ("python3 -m http.server", "python3 -c 'print(1)'"):
+            with self.subTest(command=command):
+                health = server.inspect_app_health(
+                    {"command": command, "cwd": None})
+                self.assertFalse(health["blocking"])
+
+    def test_missing_runtime_is_blocking(self):
+        with mock.patch.object(server.shutil, "which", return_value=None):
+            health = server.inspect_app_health(
+                {"command": "definitely-not-installed --version", "cwd": None})
+        self.assertEqual(health["issues"][0]["kind"], "runtime-missing")
+
+    def test_direct_script_requires_execute_permission_but_bash_script_does_not(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "job.command")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("echo ok\n")
+            os.chmod(path, 0o600)
+            direct = server.inspect_app_health(
+                {"command": shlex.quote(path), "cwd": td})
+            wrapped = server.inspect_app_health(
+                {"command": "/bin/bash -- " + shlex.quote(path), "cwd": td})
+        self.assertEqual(direct["issues"][0]["kind"], "script-not-executable")
+        self.assertFalse(wrapped["blocking"])
+
+    def test_broken_script_symlink_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as td:
+            link = os.path.join(td, "job.py")
+            os.symlink(os.path.join(td, "missing.py"), link)
+            health = server.inspect_app_health(
+                {"command": server.command_for_script(link), "cwd": td})
+        self.assertEqual(health["issues"][0]["kind"], "script-missing")
+
+    def test_task_cancel_exit_code_survives_shell_wrapper(self):
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(server, "LOGS_DIR", td):
+            app = {"id": "deadbeef", "cwd": td,
+                   "command": "python3 -c 'raise SystemExit(130)'"}
+            ok, error, proc, _, _ = server.start_app(app)
+            self.assertTrue(ok, error)
+            self.assertEqual(proc.wait(timeout=3), 130)
 
 
 class ProjectDetectionTests(unittest.TestCase):
@@ -380,7 +603,10 @@ class ProcessIdentityTests(unittest.TestCase):
                 self.assertIn(proc.pid, server.managed_pids(tracked))
                 self.assertEqual(
                     server.managed_pids(dict(tracked, runToken="wrong")), [])
-                self.assertTrue(server.stop_app(tracked))
+                target, error = server.resolve_app_stop_target(tracked)
+                self.assertIsNotNone(target, error)
+                stopped, error = server.signal_app_stop(target)
+                self.assertTrue(stopped, error)
                 proc.wait(timeout=3)
             finally:
                 if proc.poll() is None:
@@ -396,7 +622,11 @@ class ProcessIdentityTests(unittest.TestCase):
         with mock.patch.object(server, "managed_pids", return_value=[]), \
                 mock.patch.object(server, "legacy_managed_pid", return_value=999), \
                 mock.patch.object(server.os, "kill") as stop:
-            self.assertTrue(server.stop_app(app, {(999, 8080)}))
+            target, error = server.resolve_app_stop_target(
+                app, {(999, 8080)})
+            self.assertIsNone(error)
+            stopped, error = server.signal_app_stop(target)
+            self.assertTrue(stopped, error)
         stop.assert_called_once_with(999, signal.SIGTERM)
 
     def test_running_app_can_be_stopped_in_place_before_update(self):
@@ -415,12 +645,97 @@ class ProcessIdentityTests(unittest.TestCase):
         cfg = mock.Mock()
         app = {"id": "a", "runToken": None}
         with mock.patch.object(server, "app_alive_sign", return_value=False), \
-                mock.patch.object(server, "stop_app") as stop:
+                mock.patch.object(server, "stop_app_and_clear") as stop:
             ok, error, stopped = server.stop_app_for_update(cfg, app)
 
         self.assertTrue(ok, error)
         self.assertFalse(stopped)
         stop.assert_not_called()
+
+    def test_attach_claims_current_user_listener_via_legacy_identity(self):
+        stored = {"apps": [{"id": "a", "port": 8080, "cwd": "/old",
+                            "kind": "service"}]}
+        cfg = mock.Mock()
+        cfg.snapshot.return_value = stored
+        cfg.update.side_effect = lambda op: op(stored)
+        app = dict(stored["apps"][0])
+        with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                mock.patch.object(server, "scan_listeners",
+                                  return_value={(4242, 8080)}), \
+                mock.patch.object(server, "ps_snapshot",
+                                  return_value={4242: {"uid": server.SELF_UID}}), \
+                mock.patch.object(server, "listener_app_owners",
+                                  return_value={}), \
+                mock.patch.object(server, "lsof_cwds",
+                                  return_value={4242: "/new"}):
+            ok, error, info = server.attach_app_process(cfg, "a", app, 4242)
+
+        self.assertTrue(ok, error)
+        target = stored["apps"][0]
+        self.assertEqual(target["lastPid"], 4242)
+        self.assertIsNone(target["lastPgid"])
+        self.assertIsNone(target["runToken"])
+        self.assertTrue(target["attached"])
+        self.assertEqual(target["cwd"], "/new")
+        self.assertTrue(info["cwdUpdated"])
+
+    def test_attached_listener_survives_child_pid_rotation_by_unique_cwd(self):
+        app = {"id": "a", "port": 3000, "cwd": "/project",
+               "kind": "service", "lastPid": 4242, "attached": True}
+        pid = server.legacy_managed_pid(
+            app,
+            listeners={(5252, 3000), (6262, 3000)},
+            snap={
+                5252: {"uid": server.SELF_UID},
+                6262: {"uid": server.SELF_UID},
+            },
+            cwds={5252: "/project", 6262: "/other"},
+        )
+        self.assertEqual(pid, 5252)
+
+    def test_attached_listener_requires_a_unique_uid_cwd_match(self):
+        app = {"id": "a", "port": 3000, "cwd": "/project",
+               "kind": "service", "lastPid": 4242, "attached": True}
+        common = {
+            "listeners": {(5252, 3000), (6262, 3000)},
+            "snap": {
+                5252: {"uid": server.SELF_UID},
+                6262: {"uid": server.SELF_UID},
+            },
+        }
+        self.assertIsNone(server.legacy_managed_pid(
+            app, **common, cwds={5252: "/other", 6262: "/elsewhere"}))
+        self.assertIsNone(server.legacy_managed_pid(
+            app, **common, cwds={5252: "/project", 6262: "/project"}))
+
+    def test_attach_rejects_foreign_unrelated_or_running(self):
+        cfg = mock.Mock()
+        app = {"id": "a", "port": 8080, "kind": "service"}
+        with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                mock.patch.object(server, "scan_listeners",
+                                  return_value={(4242, 9999)}):
+            ok, error, _ = server.attach_app_process(cfg, "a", app, 4242)
+        self.assertFalse(ok)
+        self.assertIn("并未监听", error)
+
+        with mock.patch.object(server, "app_alive_sign", return_value=False), \
+                mock.patch.object(server, "scan_listeners",
+                                  return_value={(4242, 8080)}), \
+                mock.patch.object(server, "ps_snapshot",
+                                  return_value={4242: {"uid": server.SELF_UID + 1}}):
+            ok, error, _ = server.attach_app_process(cfg, "a", app, 4242)
+        self.assertFalse(ok)
+        self.assertIn("不属于当前用户", error)
+
+        with mock.patch.object(server, "app_alive_sign", return_value=True):
+            ok, error, _ = server.attach_app_process(cfg, "a", app, 4242)
+        self.assertFalse(ok)
+        self.assertIn("已在运行", error)
+
+        task = {"id": "a", "port": None, "kind": "task"}
+        ok, error, _ = server.attach_app_process(cfg, "a", task, 4242)
+        self.assertFalse(ok)
+        self.assertIn("批处理任务", error)
 
     def test_task_exit_records_duration_and_unique_run_time(self):
         with tempfile.TemporaryDirectory() as td, \
@@ -442,8 +757,27 @@ class ProcessIdentityTests(unittest.TestCase):
             result = cfg.snapshot()["apps"][0]["lastExit"]
 
         self.assertEqual(result["code"], 0)
+        self.assertEqual(result["status"], "succeeded")
         self.assertAlmostEqual(result["durationSec"], 1.25, delta=0.2)
         self.assertEqual(result["startedAt"], int(started_at * 1000))
+
+    def test_task_exit_status_classifier_covers_cancel_and_failure(self):
+        self.assertEqual(server.classify_task_exit(0), "succeeded")
+        self.assertEqual(server.classify_task_exit(130), "canceled")
+        self.assertEqual(server.classify_task_exit(1), "failed")
+        self.assertEqual(server.classify_task_exit(-15), "failed")
+
+    def test_old_task_exit_status_is_normalized_only_for_api_output(self):
+        legacy = {"code": 0, "at": 123}
+        app = {"kind": "task", "lastExit": legacy}
+        public = server.public_last_exit(app)
+        self.assertEqual(public["status"], "succeeded")
+        self.assertNotIn("status", legacy)
+        stopped = server.public_last_exit({
+            "kind": "task",
+            "lastExit": {"status": "canceled", "code": None, "at": 456},
+        })
+        self.assertEqual(stopped["status"], "stopped")
 
     def test_task_start_preserves_previous_completed_result(self):
         with tempfile.TemporaryDirectory() as td:
@@ -499,6 +833,74 @@ class LaunchEnvironmentTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
+    def test_app_and_service_expose_ipv6_aware_open_host(self):
+        app = {**server.Config.APP_DEFAULT, "id": "vite", "name": "公众号排版",
+               "command": "npm run dev", "cwd": "/tmp/vite", "port": 5173}
+        listeners = {(4242, 5173): {"::1"}}
+        proc = {
+            4242: {
+                "uid": server.SELF_UID, "comm": "/usr/local/bin/node",
+                "args": "node vite", "cpu": 0.1, "mem": 0.2, "etime": 12,
+            },
+        }
+        with mock.patch.object(server, "scan_listeners", return_value=listeners), \
+                mock.patch.object(server, "ps_snapshot", return_value=proc), \
+                mock.patch.object(server, "lsof_cwds",
+                                  return_value={4242: "/tmp/vite"}), \
+                mock.patch.object(
+                    server, "managed_process_index",
+                    return_value=({"vite": [4242]}, proc, {})):
+            service = server.build_services({"apps": [app]})[0][0]
+            built_app = server.build_apps({"apps": [app]}, listeners)[0]
+
+        self.assertEqual(service["openHost"], "localhost")
+        self.assertEqual(built_app["openHosts"], {"5173": "localhost"})
+
+    def test_service_listener_is_linked_by_managed_identity_not_configured_port(self):
+        app = {**server.Config.APP_DEFAULT, "id": "old-card",
+               "name": "旧项目", "command": "npm run dev",
+               "cwd": "/tmp/old", "port": 3000}
+        listener = {
+            83182: {
+                "uid": server.SELF_UID,
+                "comm": "/usr/local/bin/next-server",
+                "args": "next-server",
+                "cpu": 0.1,
+                "mem": 0.2,
+                "etime": 42,
+            },
+        }
+        common = [
+            mock.patch.object(server, "scan_listeners",
+                              return_value={(83182, 3000)}),
+            mock.patch.object(server, "ps_snapshot", return_value=listener),
+            mock.patch.object(server, "lsof_cwds",
+                              return_value={83182: "/tmp/new-blog"}),
+        ]
+        with common[0], common[1], common[2], mock.patch.object(
+                server, "managed_process_index",
+                return_value=({"old-card": []}, {}, {})):
+            row = server.build_services({"apps": [app]})[0][0]
+
+        self.assertIsNone(row["appId"])
+        self.assertIsNone(row["appName"])
+        self.assertEqual(row["project"], "new-blog")
+        self.assertEqual(row["instanceKey"], "83182:3000")
+
+        with mock.patch.object(server, "scan_listeners",
+                               return_value={(83182, 3000)}), \
+                mock.patch.object(server, "ps_snapshot",
+                                  return_value=listener), \
+                mock.patch.object(server, "lsof_cwds",
+                                  return_value={83182: "/tmp/old"}), \
+                mock.patch.object(
+                    server, "managed_process_index",
+                    return_value=({"old-card": [83182]}, {}, {})):
+            managed_row = server.build_services({"apps": [app]})[0][0]
+
+        self.assertEqual(managed_row["appId"], "old-card")
+        self.assertEqual(managed_row["appName"], "旧项目")
+
     def test_legacy_listener_is_recognized_only_with_full_identity_match(self):
         app = {**server.Config.APP_DEFAULT, "id": "legacy", "name": "Legacy",
                "command": "python3 app.py", "cwd": "/tmp/project",
@@ -537,7 +939,7 @@ class StateTests(unittest.TestCase):
         self.assertEqual(row["portOwner"]["cwd"], "/tmp/other")
         self.assertTrue(row["portOwner"]["currentUser"])
 
-    def test_duplicate_configured_ports_are_explicit(self):
+    def test_duplicate_configured_ports_are_allowed_until_runtime(self):
         a = {**server.Config.APP_DEFAULT, "id": "a", "name": "A",
              "command": "x", "port": 8080}
         b = {**server.Config.APP_DEFAULT, "id": "b", "name": "B",
@@ -546,20 +948,37 @@ class StateTests(unittest.TestCase):
                 server, "managed_process_index",
                 return_value=({"a": [], "b": []}, {}, {})):
             rows = server.build_apps({"apps": [a, b]}, set())
-        self.assertTrue(all(row["portConflict"] for row in rows))
-        self.assertEqual(rows[0]["portConflictApps"], ["B"])
-        self.assertEqual(server.find_port_conflicts({"apps": [a, b]}, 8080, "a"), [b])
+        self.assertTrue(all(not row["portConflict"] for row in rows))
+        self.assertTrue(all(row["portConflictApps"] == [] for row in rows))
+        self.assertTrue(all(not row["portOccupied"] for row in rows))
+
+    def test_app_state_exposes_health_and_normalizes_legacy_task_result(self):
+        task = {**server.Config.APP_DEFAULT, "id": "task", "name": "Task",
+                "kind": "task", "command": "echo ok",
+                "lastExit": {"code": 0, "at": 123}}
+        with mock.patch.object(
+                server, "managed_process_index",
+                return_value=({"task": []}, {}, {})):
+            row = server.build_apps({"apps": [task]}, set())[0]
+        self.assertEqual(row["health"]["status"], "ok")
+        self.assertFalse(row["health"]["blocking"])
+        self.assertEqual(row["lastExit"]["status"], "succeeded")
+        self.assertNotIn("status", task["lastExit"])
 
     def test_watched_processes_are_current_user_only(self):
         snap = {
-            10: {"uid": server.SELF_UID, "comm": "ffmpeg", "args": "ffmpeg -i a",
+            10: {"uid": server.SELF_UID, "comm": "ffmpeg",
+                 "args": "ffmpeg -i render-worker.mov",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
             11: {"uid": server.SELF_UID + 1, "comm": "ffmpeg", "args": "ffmpeg -i b",
                  "cpu": 1.0, "mem": 2.0, "etime": 3},
         }
         with mock.patch.object(server, "ps_snapshot", return_value=snap):
-            rows = server.build_watched(["ffmpeg"])
+            rows = server.build_watched(
+                ["ffmpeg", "render-worker", "FFMPEG"])
         self.assertEqual([row["pid"] for row in rows], [10])
+        self.assertEqual(rows[0]["keywords"], ["ffmpeg", "render-worker"])
+        self.assertEqual(rows[0]["keyword"], "ffmpeg、render-worker")
 
 
 class LogTests(unittest.TestCase):
@@ -712,50 +1131,65 @@ class DiagnoseTests(unittest.TestCase):
         issue = next(i for i in r["issues"] if i["kind"] == "npm-script")
         self.assertIn("dev", issue["detail"])
 
-    def test_exit_127_falls_back_to_command_not_found(self):
+    def test_exit_127_reports_missing_runtime_before_log_fallback(self):
         app = {"id": "aabbccdd", "cwd": None, "command": "nooope",
                "port": None, "lastExit": {"code": 127}}
         r = self._run(app)
-        self.assertTrue(any(i["kind"] == "not-found" for i in r["issues"]))
+        self.assertTrue(any(i["kind"] == "runtime-missing" for i in r["issues"]))
 
-    def test_duplicate_port_config(self):
+    def test_duplicate_port_config_is_not_a_diagnostic_error(self):
         a1 = {"id": "aabbccdd", "name": "A", "cwd": None, "command": "x",
               "port": 8080, "lastExit": {"code": 1}}
         a2 = {"id": "eeff0011", "name": "B", "cwd": None, "command": "y", "port": 8080}
         r = self._run(a1, cfg_apps=[a1, a2])
-        self.assertTrue(any(i["kind"] == "port-dup" for i in r["issues"]))
+        self.assertFalse(any(i["kind"] == "port-dup" for i in r["issues"]))
 
     def test_clean_log_reports_no_match(self):
-        app = {"id": "aabbccdd", "cwd": None, "command": "x",
+        app = {"id": "aabbccdd", "cwd": None, "command": "echo ok",
                "port": None, "lastExit": {"code": 1}}
         r = self._run(app, log="some random output")
         self.assertEqual(r["issues"], [])
         self.assertIn("常见错误模式", r["summary"])
 
+    def test_successful_task_is_not_diagnosed_as_quick_exit(self):
+        app = {"id": "aabbccdd", "kind": "task", "cwd": None,
+               "command": "echo ok", "port": None,
+               "lastExit": {"code": 0, "status": "succeeded"}}
+        r = self._run(app, log="ok")
+        self.assertFalse(any(i["kind"] == "quick-exit" for i in r["issues"]))
+
+    def test_static_health_issue_is_included_before_a_failed_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "missing.py")
+            app = {"id": "aabbccdd", "kind": "task", "cwd": td,
+                   "command": server.command_for_script(missing),
+                   "port": None, "lastExit": None}
+            r = self._run(app)
+        issue = next(i for i in r["issues"] if i["kind"] == "script-missing")
+        self.assertEqual(issue["action"], "pick-script")
+
 
 class ThemeTests(unittest.TestCase):
     def test_list_themes_reads_manifests(self):
         listed = server.list_themes()
-        self.assertEqual([theme["id"] for theme in listed], ["apollo", "candy"])
+        self.assertEqual([theme["id"] for theme in listed], ["ops"])
         themes = {t["id"]: t for t in listed}
-        self.assertIn("apollo", themes)
-        self.assertIn("candy", themes)
-        self.assertTrue(themes["apollo"]["colors"])
-        self.assertEqual(themes["candy"]["name"], "Candy 彩色块")
+        self.assertEqual(themes["ops"]["name"], "Ops 指挥台")
+        self.assertTrue(themes["ops"]["colors"])
 
     def test_config_defaults_ui_theme(self):
         with tempfile.TemporaryDirectory() as td:
             cfg = server.Config(os.path.join(td, "config.json"))
-            self.assertEqual(cfg.snapshot()["uiTheme"], "apollo")
+            self.assertEqual(cfg.snapshot()["uiTheme"], "ops")
 
     def test_config_preserves_ui_theme_and_scalars(self):
         with tempfile.TemporaryDirectory() as td:
             path = os.path.join(td, "config.json")
             cfg = server.Config(path)
-            cfg.update(lambda d: d.__setitem__("uiTheme", "candy"))
+            cfg.update(lambda d: d.__setitem__("uiTheme", "custom"))
             cfg2 = server.Config(path)
             snap = cfg2.snapshot()
-            self.assertEqual(snap["uiTheme"], "candy")
+            self.assertEqual(snap["uiTheme"], "custom")
             self.assertIsInstance(snap["apps"], list)
 
 

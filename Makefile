@@ -1,7 +1,7 @@
 PYTHON ?= python3
 DIST_DIR ?= dist
 
-.PHONY: check syntax test release-check release release-verify dev-setup generate-icons generate-textures
+.PHONY: check syntax test release-check release release-verify dev-setup generate-icons generate-brand
 
 check:
 	$(PYTHON) tools/check_project.py
@@ -28,5 +28,5 @@ dev-setup:
 generate-icons:
 	$(PYTHON) tools/gen_icons.py
 
-generate-textures:
-	$(PYTHON) tools/gen_textures.py
+generate-brand:
+	$(PYTHON) tools/gen_brand_assets.py

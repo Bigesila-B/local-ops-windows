@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import plistlib
@@ -96,13 +97,24 @@ def check_required_files() -> str:
         "README.md",
         "CHANGELOG.md",
         "LICENSE",
+        "SECURITY.md",
+        "CONTRIBUTING.md",
+        "CODE_OF_CONDUCT.md",
+        "ASSET_PROVENANCE.md",
         "THIRD_PARTY_NOTICES.md",
         "RELEASE_CHECKLIST.md",
+        ".github/workflows/ci.yml",
+        ".github/ISSUE_TEMPLATE/config.yml",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/feature_request.yml",
+        ".github/PULL_REQUEST_TEMPLATE.md",
         "requirements-dev.txt",
         "Makefile",
         "server.py",
         "start.command",
         "tests/test_server.py",
+        "docs/screenshots/ops-launchpad.jpg",
+        "docs/screenshots/ops-services.jpg",
         "static/index.html",
         "static/app.js",
         "总控台.app/Contents/Info.plist",
@@ -111,6 +123,66 @@ def check_required_files() -> str:
     missing = [name for name in required if not (ROOT / name).is_file()]
     require(not missing, "缺少必要文件: " + ", ".join(missing))
     return f"{len(required)} 个必要文件"
+
+
+def check_asset_provenance() -> str:
+    path = ROOT / "ASSET_PROVENANCE.md"
+    require(path.is_file(), "ASSET_PROVENANCE.md 不存在")
+    text = path.read_text(encoding="utf-8")
+    tracked = [
+        item
+        for folder in (STATIC / "assets", STATIC / "fonts")
+        for item in sorted(folder.rglob("*"))
+        if item.is_file()
+    ]
+    tracked.append(ROOT / "总控台.app" / "Contents" / "Resources" / "AppIcon.icns")
+    missing = [
+        item.relative_to(ROOT).as_posix()
+        for item in tracked
+        if item.relative_to(ROOT).as_posix() not in text
+    ]
+    require(not missing, "素材台账缺少文件: " + ", ".join(missing))
+    stale = [
+        item.relative_to(ROOT).as_posix()
+        for item in tracked
+        if hashlib.sha256(item.read_bytes()).hexdigest() not in text
+    ]
+    require(not stale, "素材台账缺少当前 SHA-256: " + ", ".join(stale))
+    for status in ("CLEARED", "REVIEW_REQUIRED", "BLOCKED", "TO_REPLACE"):
+        require(f"`{status}`" in text, f"素材台账缺少状态定义: {status}")
+    return f"{len(tracked)} 个素材文件已登记"
+
+
+def asset_release_statuses() -> list[tuple[str, str]]:
+    text = (ROOT / "ASSET_PROVENANCE.md").read_text(encoding="utf-8")
+    section = "未命名素材"
+    statuses: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        if line.startswith("### "):
+            section = line[4:].strip()
+            continue
+        match = re.fullmatch(
+            r"- 状态[：:]\s*`(CLEARED|REVIEW_REQUIRED|BLOCKED|TO_REPLACE)`\s*",
+            line,
+        )
+        if match:
+            statuses.append((section, match.group(1)))
+    return statuses
+
+
+def check_asset_release_status() -> str:
+    statuses = asset_release_statuses()
+    require(bool(statuses), "素材台账没有可核验的状态记录")
+    blockers = [
+        f"{section}={status}"
+        for section, status in statuses
+        if status in {"BLOCKED", "TO_REPLACE"}
+    ]
+    require(
+        not blockers,
+        "公开发行仍包含未清权或待替换素材: " + ", ".join(blockers),
+    )
+    return f"{len(statuses)} 项素材无 BLOCKED/TO_REPLACE"
 
 
 def read_version() -> str:
@@ -164,6 +236,161 @@ def check_javascript_syntax() -> str:
     return f"{len(paths)} 个 JavaScript 文件"
 
 
+def strip_javascript_literals_and_comments(source: str) -> str:
+    """移除字符串/注释内容但保留换行和长度，供轻量静态绑定检查使用。"""
+    output: list[str] = []
+    index = 0
+    state = "code"
+    quote = ""
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if state == "code":
+            if char == "/" and following == "/":
+                output.extend((" ", " "))
+                index += 2
+                state = "line-comment"
+                continue
+            if char == "/" and following == "*":
+                output.extend((" ", " "))
+                index += 2
+                state = "block-comment"
+                continue
+            if char == "/":
+                previous = next(
+                    (item for item in reversed(output) if not item.isspace()), "")
+                if previous in ("(", ",", "=", ":", "[", "!", "?", "{", ";"):
+                    output.append(" ")
+                    index += 1
+                    state = "regex"
+                    continue
+            if char in ("'", '"', "`"):
+                quote = char
+                output.append(" ")
+                index += 1
+                state = "string"
+                continue
+            output.append(char)
+            index += 1
+            continue
+        if state == "line-comment":
+            output.append("\n" if char == "\n" else " ")
+            index += 1
+            if char == "\n":
+                state = "code"
+            continue
+        if state == "block-comment":
+            if char == "*" and following == "/":
+                output.extend((" ", " "))
+                index += 2
+                state = "code"
+            else:
+                output.append("\n" if char == "\n" else " ")
+                index += 1
+            continue
+        if state in ("regex", "regex-class"):
+            if char == "\\":
+                output.append(" ")
+                index += 1
+                if index < len(source):
+                    output.append("\n" if source[index] == "\n" else " ")
+                    index += 1
+                continue
+            output.append("\n" if char == "\n" else " ")
+            index += 1
+            if char == "\n":
+                state = "code"
+            elif state == "regex" and char == "[":
+                state = "regex-class"
+            elif state == "regex-class" and char == "]":
+                state = "regex"
+            elif state == "regex" and char == "/":
+                state = "code"
+            continue
+        # string / template literal
+        if char == "\\":
+            output.append(" ")
+            index += 1
+            if index < len(source):
+                output.append("\n" if source[index] == "\n" else " ")
+                index += 1
+            continue
+        output.append("\n" if char == "\n" else " ")
+        index += 1
+        if char == quote:
+            state = "code"
+    return "".join(output)
+
+
+def javascript_exported_callables(source: str) -> set[str]:
+    """提取 `export function` 与导出的箭头函数名称。"""
+    names = set(re.findall(
+        r"^\s*export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)",
+        source, flags=re.M,
+    ))
+    names.update(re.findall(
+        r"^\s*export\s+const\s+([A-Za-z_$][\w$]*)\s*=\s*"
+        r"(?:async\s*)?(?:\([^)\n]*\)|[A-Za-z_$][\w$]*)\s*=>",
+        source, flags=re.M,
+    ))
+    return names
+
+
+def javascript_imported_bindings(source: str) -> set[str]:
+    """提取命名导入在当前模块中的本地名称（支持 `as`）。"""
+    names: set[str] = set()
+    for body in re.findall(
+            r"\bimport\s*\{(.*?)\}\s*from\s*['\"][^'\"]+['\"]",
+            source, flags=re.S):
+        for item in body.split(","):
+            item = re.sub(r"/\*.*?\*/|//[^\n]*", "", item, flags=re.S).strip()
+            if not item:
+                continue
+            local = re.split(r"\s+as\s+", item)[-1].strip()
+            if re.fullmatch(r"[A-Za-z_$][\w$]*", local):
+                names.add(local)
+    return names
+
+
+def find_unbound_shared_calls(source: str, shared_callables: set[str]) -> list[str]:
+    """找出调用了 core 公共函数、但本模块既未导入也未声明的名称。"""
+    scrubbed = strip_javascript_literals_and_comments(source)
+    bound = javascript_imported_bindings(source)
+    bound.update(re.findall(
+        r"\b(?:function|class)\s+([A-Za-z_$][\w$]*)", scrubbed))
+    bound.update(re.findall(
+        r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)", scrubbed))
+    missing = []
+    for name in sorted(shared_callables):
+        call = re.compile(
+            r"(?<![\w$.])" + re.escape(name) + r"\s*\(")
+        if name not in bound and call.search(scrubbed):
+            missing.append(name)
+    return missing
+
+
+def check_javascript_bindings() -> str:
+    """捕获语法检查发现不了的公共函数漏导入（例如点击后才触发的 del）。"""
+    core_path = STATIC / "js" / "core.js"
+    require(core_path.is_file(), "static/js/core.js 不存在")
+    shared = javascript_exported_callables(
+        core_path.read_text(encoding="utf-8"))
+    require(bool(shared), "没有识别到 core.js 的公共函数")
+    failures: list[str] = []
+    checked = 0
+    for path in sorted(STATIC.rglob("*.js")):
+        if path == core_path:
+            continue
+        source = path.read_text(encoding="utf-8")
+        missing = find_unbound_shared_calls(source, shared)
+        if missing:
+            failures.append(
+                f"{path.relative_to(ROOT)} 缺少绑定: {', '.join(missing)}")
+        checked += 1
+    require(not failures, "\n".join(failures))
+    return f"{checked} 个模块，{len(shared)} 个公共可调用导出"
+
+
 def check_shell_and_plist() -> str:
     shell_files = (
         ROOT / "start.command",
@@ -214,11 +441,10 @@ def check_themes() -> str:
         require(isinstance(colors, list) and colors, f"{manifest.name} 缺少 colors")
         css = manifest.with_suffix(".css")
         require(css.is_file() and css.stat().st_size > 0, f"缺少主题 CSS: {css.name}")
-    require({"apollo", "candy"}.issubset(ids), "内置 Apollo/Candy 主题不完整")
-    require((theme_dir / "theme-template.css").is_file(), "缺少主题作者模板")
+    require("ops" in ids, "缺少默认主题 ops")
     orphan_css = {
         path.stem for path in theme_dir.glob("*.css")
-        if path.name != "theme-template.css" and path.stem not in ids
+        if path.stem not in ids
     }
     require(not orphan_css, "存在未注册主题 CSS: " + ", ".join(sorted(orphan_css)))
     return ", ".join(sorted(ids))
@@ -321,6 +547,21 @@ def check_tests() -> str:
     return f"{count} 个测试"
 
 
+def check_javascript_tests() -> str:
+    """运行前端纯函数行为测试（node --test，零依赖）。"""
+    node = shutil.which("node")
+    require(bool(node), "未找到 node，无法运行 JavaScript 测试")
+    files = sorted(str(path) for path in (ROOT / "tests" / "js").glob("*.test.mjs"))
+    require(bool(files), "tests/js/ 下没有 .test.mjs 测试文件")
+    output = command_output([node, "--test", *files])
+    match = re.search(r"# (pass)\s+(\d+)", output)
+    require(match is not None, "无法确认 node --test 结果")
+    passed = int(match.group(2))
+    require("# fail" not in output or re.search(r"# fail\s+0$", output, re.M),
+            "JavaScript 测试存在失败项")
+    return f"{passed} 个测试"
+
+
 def check_release_git() -> str:
     git = shutil.which("git")
     require(bool(git), "未找到 git")
@@ -369,8 +610,10 @@ def main() -> int:
         ("版本一致性", check_version),
         ("Python 语法", check_python_syntax),
         ("JavaScript 语法", check_javascript_syntax),
+        ("JavaScript 模块绑定", check_javascript_bindings),
         ("启动脚本与 plist", check_shell_and_plist),
         ("开发依赖锁定", check_dev_requirements),
+        ("素材来源台账", check_asset_provenance),
         ("主题注册表", check_themes),
         ("静态资源与模块", check_static_references),
         ("生成图标同步", check_generated_icons),
@@ -379,12 +622,19 @@ def main() -> int:
         report.check(label, fn)
     if not args.skip_tests:
         report.check("后端测试", check_tests)
+        report.check("JavaScript 行为测试", check_javascript_tests)
     if args.release:
+        report.check("素材发布状态", check_asset_release_status)
         report.check("Git 发布边界", check_release_git)
-        if (STATIC / "fonts" / "AlibabaPuHuiTi-55.otf").exists():
+        reviews = [
+            section
+            for section, status in asset_release_statuses()
+            if status == "REVIEW_REQUIRED"
+        ]
+        if reviews:
             report.warn(
-                "自动检查不能证明普惠体精简文件的对外分发权；"
-                "必须人工完成 THIRD_PARTY_NOTICES.md 与 RELEASE_CHECKLIST.md 的核验。"
+                f"素材台账仍有 {len(reviews)} 项 REVIEW_REQUIRED；"
+                "发布负责人必须形成书面结论: " + ", ".join(reviews)
             )
 
     print()

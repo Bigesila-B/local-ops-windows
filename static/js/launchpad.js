@@ -2,13 +2,16 @@
 /* ============================================================
    launchpad.js — 启动台：应用卡片 / 拖拽排序 / 端口诊断 / 启动诊断
    ============================================================ */
-import { $, el, setText, setChildren, icon, iconBtn, escapeHtml,
-  post, act, toast, openLayer, closeLayer, reconcile,
-  state, findApp, fmtUptime, fmtDuration } from './core.js';
-import { openConfirm, confirmKill, openAppModal, openLogs, getIconVer } from './overlays.js';
+import { $, el, setText, setChildren, setKpi, setKpiUnit, icon, iconBtn, escapeHtml,
+  post, del, act, toast, openLayer, closeLayer, reconcile,
+  state, findApp, fmtUptime, fmtDuration, taskExitStatus,
+  localServiceUrl } from './core.js';
+import { openConfirm, openAppModal, openLogs, getIconVer } from './overlays.js';
+import { configuredPort, actualPorts, hasPortMismatch,
+  preferredOpenPort, displayedPorts, portIsOpenable } from './ports.js';
 
 const svcGrid = $('#svcGrid'), taskGrid = $('#taskGrid');
-
+const reorderStatus = $('#reorderStatus');
 /* ---------------- 图标取色光晕 ---------------- */
 function hueFromString(s) {
   let h = 0;
@@ -52,13 +55,11 @@ function updateCardGlow(card, app) {
 
 const FAVICON_RETRY_DELAYS = [5000, 15000, 60000];
 function maybeFetchFavicon(card, app) {
-  if (app.icon || app.glyph || app.favicon || !app.running
-      || (app.port && app.listening === false)) {
+  const port = preferredOpenPort(app);
+  if (app.icon || app.glyph || app.favicon || !app.running || !port) {
     if (app.favicon) card._favFetch = null;
     return;
   }
-  const port = app.port || (app.ports && app.ports[0]);
-  if (!port) return;
   const signature = String(app.pid || app.lastPid || port);
   if (!card._favFetch || card._favFetch.signature !== signature) {
     card._favFetch = { signature, attempts: 0, nextAt: 0, inFlight: false };
@@ -81,7 +82,11 @@ function maybeFetchFavicon(card, app) {
 
 function createAppCard() {
   const card = el('article', 'app-card');
+  card.tabIndex = 0;
+  card.setAttribute('aria-describedby', 'reorderInstructions');
+  card.setAttribute('aria-roledescription', '可排序应用卡片');
   card.addEventListener('pointerdown', cardPointerDown);
+  card.addEventListener('keydown', cardSortKeyDown);
 
   const head = el('div', 'app-head');
   const iconBox = el('div', 'app-icon');
@@ -142,9 +147,9 @@ function createAppCard() {
   primary.addEventListener('click', () => toggleApp(id(), primary));
   bCopy.addEventListener('click', async () => {
     const a = findApp(id());
-    const p = a && (a.port || (a.ports && a.ports[0]));
+    const p = preferredOpenPort(a);
     if (!p) return;
-    const url = 'http://127.0.0.1:' + p;
+    const url = localServiceUrl(a, p);
     try {
       await navigator.clipboard.writeText(url);
       toast('已复制 ' + url);
@@ -154,14 +159,14 @@ function createAppCard() {
   });
   stPort.addEventListener('click', () => {
     const a = findApp(id());
-    const p = a && (a.port || (a.ports && a.ports[0]));
+    const p = preferredOpenPort(a);
     if (a && (a.portConflict || a.portOccupied)) {
       openPortDiagnostic(a);
       return;
     }
     /* listening 是新后端字段；旧进程热加载前会缺失，缺失时保持兼容。 */
-    if (a && a.running && (!a.port || a.listening !== false) && p) {
-      window.open('http://127.0.0.1:' + p, '_blank', 'noopener,noreferrer');
+    if (portIsOpenable(a) && p) {
+      window.open(localServiceUrl(a, p), '_blank', 'noopener,noreferrer');
     }
   });
   bLogs.addEventListener('click', () => { const a = findApp(id()); if (a) openLogs(a); });
@@ -175,12 +180,13 @@ function createAppCard() {
   return card;
 }
 
-/* 主按钮：服务 = 启动/停止；批处理 = 运行/停止（运行中红色可中止） */
+/* 主按钮：服务 = 启动/停止；批处理 = 运行/中止。 */
 function setPrimary(btn, running, kind) {
   const sig = running + '|' + kind;
   if (btn._sig === sig) return;
   btn._sig = sig;
-  const label = running ? '停止' : (kind === 'task' ? '运行' : '启动');
+  const label = running ? (kind === 'task' ? '中止' : '停止')
+    : (kind === 'task' ? '运行' : '启动');
   setChildren(btn, icon(running ? 'square' : 'play', 13));
   btn.appendChild(document.createTextNode(label));
   btn.classList.toggle('btn-stop', running);
@@ -236,10 +242,17 @@ function updateAppCard(card, app) {
   /* 状态副行：运行态、端口冲突，以及服务/任务上次退出结果。 */
   const kind = app.kind || 'service';
   const isTask = kind === 'task';
-  const taskCompleted = isTask && !app.running && !!app.lastExit;
-  const taskFailed = taskCompleted && app.lastExit.code !== 0;
+  const taskStatus = isTask && app.lastExit ? taskExitStatus(app.lastExit) : '';
+  const taskFinished = isTask && !app.running && !!app.lastExit;
+  const taskFailed = taskFinished && taskStatus === 'failed';
+  const taskSucceeded = taskFinished && taskStatus === 'succeeded';
+  const healthIssues = app.health && Array.isArray(app.health.issues)
+    ? app.health.issues : [];
+  const healthIssue = app.health && app.health.blocking && healthIssues.length
+    ? healthIssues[0] : null;
+  const portMismatch = hasPortMismatch(app);
   r.dot.classList.toggle('running', !!app.running);
-  r.dot.classList.toggle('success', taskCompleted && !taskFailed);
+  r.dot.classList.toggle('success', taskSucceeded);
   r.dot.classList.toggle('danger', taskFailed);
   let stTxt = app.running ? '运行中' : (app.port ? '已停止' : '未运行');
   let stFail = false;
@@ -250,18 +263,31 @@ function updateAppCard(card, app) {
   } else if (app.portOccupied) {
     stTxt = '端口被占用';
     stFail = true;
+  } else if (portMismatch) {
+    stTxt = '端口配置不一致';
+    stFail = true;
   } else if (app.running && app.port && app.listening === false) {
     stTxt = '等待端口';
+  } else if (!app.running && healthIssue) {
+    stTxt = healthIssue.title || '配置不可用';
+    stFail = true;
+  } else if (taskFinished && (taskStatus === 'canceled' || taskStatus === 'stopped')) {
+    stTxt = taskStatus === 'canceled' ? '已取消' : '已中止';
+    const endedAt = Number(app.lastExit.at);
+    if (Number.isFinite(endedAt) && endedAt > 0) {
+      const ago = fmtUptime(Date.now() / 1000 - endedAt);
+      taskHistoryText = ago === '刚刚' ? ago : ago + '前';
+    }
   } else if (!app.running && app.lastExit) {
-    const ok = app.lastExit.code === 0;
+    const ok = isTask ? taskStatus === 'succeeded' : app.lastExit.code === 0;
     stFail = !ok;
     const ago = fmtUptime(Date.now() / 1000 - app.lastExit.at);
     const agoText = ago === '刚刚' ? ago : ago + '前';
     const what = app.port
       ? (ok ? '服务已退出'
         : (app.lastExit.code < 0 ? '服务被终止' : '启动失败 exit ' + app.lastExit.code))
-      : (ok ? '上次成功'
-        : (app.lastExit.code < 0 ? '上次被终止' : '上次失败 exit ' + app.lastExit.code));
+      : (ok ? '运行成功'
+        : (app.lastExit.code < 0 ? '运行被终止' : '运行失败 exit ' + app.lastExit.code));
     if (isTask) {
       stTxt = what;
       const duration = fmtDuration(app.lastExit.durationSec);
@@ -276,28 +302,41 @@ function updateAppCard(card, app) {
   r.taskHistory.hidden = !taskHistoryText;
   r.taskHistory.title = taskHistoryText;
   r.status.title = taskHistoryText ? stTxt + ' · ' + taskHistoryText : stTxt;
-  /* 端口：配置 port 优先，否则用进程树检测到的实际监听端口（批处理拉起服务的场景） */
-  const effPorts = app.port ? [app.port] : (app.ports || []);
-  const effPort = effPorts.length ? effPorts[0] : null;
+  card.setAttribute('aria-label', (app.name || '未命名应用') + '，' + stTxt +
+    '。按空格开始排序');
+  /* 运行中展示并打开实际监听端口；停止时才展示配置端口。 */
+  const effPorts = displayedPorts(app);
+  const effPort = preferredOpenPort(app);
   r.copy.hidden = !effPort;
   if (effPort) {
     r.stPort.hidden = false;
-    setText(r.stPort, ':' + effPort + (effPorts.length > 1 ? ' +' + (effPorts.length - 1) : ''));
-    const openable = !!app.running && (!app.port || app.listening !== false);
+    setText(r.stPort, portMismatch
+      ? ':' + effPort + (effPorts.length > 1 ? ' +' + (effPorts.length - 1) : '') +
+        ' ≠ :' + configuredPort(app)
+      : ':' + effPort + (effPorts.length > 1 ? ' +' + (effPorts.length - 1) : ''));
+    const openable = portIsOpenable(app);
     const diagnostic = !!app.portConflict || !!app.portOccupied;
     r.stPort.classList.toggle('clickable', openable && !diagnostic);
     r.stPort.classList.toggle('diagnostic', diagnostic);
-    r.stPort.title = app.portConflict
-      ? '与“' + (app.portConflictApps || []).join('、') + '”重复，请编辑端口'
-      : app.portOccupied
-        ? '端口被 PID ' + (app.portOccupiedPid || '?') + ' 占用'
-        : openable
-      ? '打开 http://127.0.0.1:' + effPort + (effPorts.length > 1 ? '（全部: ' + effPorts.join(', ') + '）' : '')
-      : '端口 ' + effPort;
+    if (app.portConflict) {
+      r.stPort.title = '与“' + (app.portConflictApps || []).join('、') +
+        '”重复，请编辑端口';
+    } else if (app.portOccupied) {
+      r.stPort.title = '端口被 PID ' + (app.portOccupiedPid || '?') + ' 占用';
+    } else if (portMismatch) {
+      r.stPort.title = '配置端口 :' + configuredPort(app) +
+        ' 未监听；实际监听：' + effPorts.map(port => ':' + port).join('、');
+    } else if (openable) {
+      r.stPort.title = '打开 ' + localServiceUrl(app, effPort) +
+        (effPorts.length > 1 ? '（全部: ' + effPorts.join(', ') + '）' : '');
+    } else {
+      r.stPort.title = '端口 ' + effPort;
+    }
     r.stPort.setAttribute('aria-label', diagnostic
       ? '诊断 ' + (app.name || '应用') + ' 的端口 ' + effPort
       : openable
-        ? '打开 ' + (app.name || '应用') + '，端口 ' + effPort
+        ? '打开 ' + (app.name || '应用') + '，' +
+          (portMismatch ? '实际端口 ' : '端口 ') + effPort
         : (app.name || '应用') + ' 的端口 ' + effPort);
   } else {
     r.stPort.hidden = true;
@@ -312,25 +351,31 @@ function updateAppCard(card, app) {
   }
   setPrimary(r.primary, !!app.running, kind);
   const appName = app.name || (isTask ? '任务' : '应用');
-  const primaryVerb = app.running ? '停止' : (isTask ? '运行' : '启动');
+  const primaryVerb = app.running ? (isTask ? '中止' : '停止')
+    : (isTask ? '运行' : '启动');
   r.primary.setAttribute('aria-label', primaryVerb + ' ' + appName);
   r.copy.setAttribute('aria-label', '复制 ' + appName + ' 的链接');
   r.logs.setAttribute('aria-label', (taskFailed ? '查看失败日志：' : '查看日志：') + appName);
-  r.diag.setAttribute('aria-label', '诊断启动失败：' + appName);
+  r.diag.setAttribute('aria-label',
+    (isTask ? '配置与运行诊断：' : '配置与启动诊断：') + appName);
   r.restart.setAttribute('aria-label', '重启 ' + appName);
   r.edit.setAttribute('aria-label', '编辑 ' + appName);
   r.del.setAttribute('aria-label', '删除 ' + appName);
   card.setAttribute('aria-label', appName + '，' + stTxt);
   r.restart.hidden = !app.running || kind !== 'service';
-  const blocked = !app.running && (!!app.portConflict || !!app.portOccupied);
+  const blocked = !app.running &&
+    (!!app.portConflict || !!app.portOccupied || !!healthIssue);
   r.primary.disabled = blocked;
   r.primary.title = app.portConflict
     ? '端口配置重复，请先编辑其中一项'
-    : app.portOccupied ? '端口已被其他进程占用' : '';
-  const launchFailed = !app.running && !!app.lastExit && app.lastExit.code !== 0;
+    : app.portOccupied ? '端口已被其他进程占用；可打开端口诊断或修改当前卡片端口'
+      : healthIssue ? healthIssue.detail || healthIssue.title : '';
+  const launchFailed = !app.running && !!app.lastExit
+    && (isTask ? taskStatus === 'failed' : app.lastExit.code !== 0);
   card.classList.toggle('running', !!app.running);
-  card.classList.toggle('has-error', !!app.portConflict || !!app.portOccupied || launchFailed);
-  r.diag.hidden = !launchFailed;
+  card.classList.toggle('has-error', !!app.portConflict || !!app.portOccupied
+    || portMismatch || launchFailed || !!healthIssue);
+  r.diag.hidden = !launchFailed && !healthIssue;
   updateCardGlow(card, app);
   r.logs.classList.toggle('attention', taskFailed);
   r.logs.title = taskFailed ? '查看失败日志' : '日志';
@@ -358,7 +403,7 @@ async function toggleApp(id, button) {
   const targetName = app.name || (isTask ? '任务' : '应用');
   toast(starting
     ? (isTask ? '正在运行 ' : '正在启动 ') + targetName + '…'
-    : '正在停止 ' + targetName + '…');
+    : (isTask ? '正在中止 ' : '正在停止 ') + targetName + '…');
   try {
     const result = await act(post('/api/apps/' + id + '/' + (starting ? 'start' : 'stop')));
     if (result && result.ok !== false) {
@@ -371,7 +416,7 @@ async function toggleApp(id, button) {
         setTimeout(window.__poll, 1800);
       } else {
         await window.__poll();
-        toast('已停止 ' + targetName);
+        toast((isTask ? '已中止 ' : '已停止 ') + targetName);
       }
     } else {
       await window.__poll();
@@ -381,7 +426,8 @@ async function toggleApp(id, button) {
       delete button.dataset.busy;
       const latest = findApp(id);
       button.disabled = !!(latest && !latest.running &&
-        (latest.portConflict || latest.portOccupied));
+        (latest.portConflict || latest.portOccupied ||
+          (latest.health && latest.health.blocking)));
     }
   }
 }
@@ -424,6 +470,8 @@ const diagUptimeRow = $('#diagUptimeRow'), diagUptime = $('#diagUptime');
 const diagCwdRow = $('#diagCwdRow'), diagCwd = $('#diagCwd');
 const diagCmdRow = $('#diagCmdRow'), diagCmd = $('#diagCmd');
 const diagNote = $('#diagNote'), diagCopy = $('#diagCopy');
+const diagOpen = $('#diagOpen'), diagEdit = $('#diagEdit');
+const diagAttach = $('#diagAttach');
 const diagKill = $('#diagKill'), diagClose = $('#diagClose');
 
 let diagCurrentApp = null;
@@ -455,18 +503,29 @@ function openPortDiagnostic(app) {
 
   if (conflict) {
     diagNote.textContent = '同一端口还被“' +
-      (app.portConflictApps || []).join('、') + '”配置。请编辑或删除其中一项。';
+      (app.portConflictApps || []).join('、') +
+      '”配置。端口同一时间只能由一个服务监听，请修改当前卡片或另一张卡片。';
   } else if (owner && owner.pid === (state.data && state.data.consolePid)) {
-    diagNote.textContent = '该端口属于当前总控台，不能在这里结束。';
+    diagNote.textContent = '该端口属于当前总控台。你可以修改当前卡片端口，不能在这里结束总控台。';
   } else if (owner && owner.currentUser) {
+    const ownerLabel = owner.project || owner.appName || owner.name || ('PID ' + owner.pid);
     diagNote.textContent = owner.appId
-      ? '占用者是另一个受管应用，可先停止它再启动当前应用。'
-      : '该进程属于当前用户，可在确认后结束它。';
+      ? '端口正在由另一个受管应用“' + ownerLabel +
+        '”使用。两张卡片可以保存相同端口；若要现在启动当前项目，请等待它停止、' +
+        '修改当前项目端口，或确认后停止占用应用。'
+      : '当前监听者“' + ownerLabel + '”并不是由这张卡片启动的。' +
+        '它仍会作为独立服务显示，两张卡片也可以保存相同端口。如果它正是本项目的服务，' +
+        '可以认领为本卡片；若要现在启动当前项目，' +
+        '请等待它停止、修改当前项目端口，或确认后结束该进程。';
   } else if (owner) {
-    diagNote.textContent = '该进程不属于当前用户，总控台只提供信息，不会结束它。';
+    diagNote.textContent = '该进程不属于当前用户。你可以打开它或修改当前卡片端口，总控台不会结束它。';
   } else {
     diagNote.textContent = '暂时无法读取占用者详情，可稍后刷新重试。';
   }
+  diagOpen.hidden = !(occupied && owner && app.port);
+  diagAttach.hidden = !(occupied && owner && owner.currentUser && !owner.appId
+    && owner.pid !== (state.data && state.data.consolePid));
+  diagEdit.hidden = !(conflict || occupied);
   diagKill.hidden = !(occupied && owner && owner.currentUser
     && owner.pid !== (state.data && state.data.consolePid));
   diagKill.textContent = owner && owner.appId ? '停止占用应用' : '结束占用进程';
@@ -482,6 +541,38 @@ export { closePortDiagnostic };
 diagClose.addEventListener('click', closePortDiagnostic);
 portDiagMask.addEventListener('mousedown', e => {
   if (e.target === portDiagMask) closePortDiagnostic();
+});
+diagOpen.addEventListener('click', () => {
+  const app = diagCurrentApp;
+  if (!app || !app.port) return;
+  window.open(localServiceUrl(app.portOwner, app.port), '_blank', 'noopener,noreferrer');
+});
+diagEdit.addEventListener('click', () => {
+  const app = diagCurrentApp;
+  if (!app) return;
+  closePortDiagnostic();
+  openAppModal(app);
+});
+diagAttach.addEventListener('click', () => {
+  const app = diagCurrentApp;
+  const owner = app && app.portOwner;
+  if (!app || !owner) return;
+  closePortDiagnostic();
+  openConfirm({
+    title: '认领为本卡片',
+    bodyHtml: '把 PID ' + escapeHtml(owner.pid) +
+      '（' + escapeHtml(owner.name || '') + '）认领为「' + escapeHtml(app.name) +
+      '」的受管进程？<div class="confirm-detail">认领后卡片显示运行中，可正常停止/重启；' +
+      '若卡片目录与进程实际目录不一致，会自动同步为实际目录。</div>',
+    okText: '认领',
+    onOk: async () => {
+      const r = await act(post('/api/apps/' + app.id + '/attach', { pid: owner.pid }));
+      if (r && r.ok) {
+        toast(r.cwdUpdated ? '已认领，卡片目录已同步为进程实际目录' : '已认领为本卡片');
+      }
+      window.__poll();
+    },
+  });
 });
 diagCopy.addEventListener('click', async () => {
   const app = diagCurrentApp;
@@ -532,7 +623,9 @@ let appDiagRequestSeq = 0;
 async function openAppDiagnosis(app) {
   const requestSeq = ++appDiagRequestSeq;
   appDiagApp = app;
-  setText(appDiagTitle, '启动诊断 · ' + (app.name || '应用'));
+  const isTask = (app.kind || 'service') === 'task';
+  setText(appDiagTitle, (isTask ? '配置与运行诊断 · ' : '配置与启动诊断 · ') +
+    (app.name || '应用'));
   appDiagList.replaceChildren();
   appDiagList.setAttribute('aria-busy', 'true');
   setText(appDiagSummary, '正在分析日志与配置…');
@@ -561,6 +654,18 @@ async function openAppDiagnosis(app) {
     const f = el('p', 'appdiag-fix');
     f.textContent = '修复建议：' + issue.fix;
     box.append(h, d, f);
+    if (issue.action) {
+      const repair = el('button', 'btn appdiag-repair');
+      repair.type = 'button';
+      repair.textContent = issue.action === 'pick-script' ? '重新选择脚本'
+        : issue.action === 'pick-cwd' ? '重新选择工作区' : '编辑执行命令';
+      repair.addEventListener('click', () => {
+        const target = appDiagApp;
+        closeAppDiagnosis();
+        if (target) openAppModal(target, null, issue.action);
+      });
+      box.appendChild(repair);
+    }
     appDiagList.appendChild(box);
   }
   setText(appDiagSummary, r.summary || '');
@@ -584,8 +689,25 @@ appDiagLogs.addEventListener('click', () => {
 });
 
 /* ---------------- 卡片拖拽排序（pointer 实现：滑块式跟手 + 虚线占位） ---------------- */
-let drag = null;  // { card, ph, grid, dx, dy }
+let drag = null;  // { card, ph, grid, dx, dy, originIndex }
+let keyboardSort = null;  // { card, grid, originalIds }
 const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+function gridAppCards(grid) {
+  return [...grid.querySelectorAll('.app-card[data-key]')];
+}
+
+function persistGridOrder(ids) {
+  return post('/api/apps/reorder', { ids })
+    .then(() => window.__poll())
+    .catch(e => toast('排序保存失败，请重试'));
+}
+
+function announceReorder(message) {
+  if (!reorderStatus) return;
+  reorderStatus.textContent = '';
+  requestAnimationFrame(() => { reorderStatus.textContent = message; });
+}
 
 /* FLIP 让位动画：重排前记录视觉位置，重排后从旧位置滑到新位置。 */
 function flip(grid, mutate) {
@@ -622,10 +744,15 @@ function flip(grid, mutate) {
 }
 
 function cardPointerDown(e) {
-  if (e.button !== 0 || drag) return;
+  if (e.button !== 0 || drag || keyboardSort) return;
   if (e.target.closest('button')) return;   // 按钮上不触发拖拽
   const card = e.currentTarget;
   const sx = e.clientX, sy = e.clientY;
+  const clearListeners = () => {
+    window.removeEventListener('pointermove', onMove);
+    window.removeEventListener('pointerup', onUp);
+    window.removeEventListener('pointercancel', onCancel);
+  };
   const onMove = ev => {
     if (!drag) {
       if (Math.abs(ev.clientX - sx) + Math.abs(ev.clientY - sy) < 6) return;  // 点击阈值
@@ -634,19 +761,22 @@ function cardPointerDown(e) {
     moveDrag(ev);
   };
   const onUp = () => {
-    window.removeEventListener('pointermove', onMove);
-    window.removeEventListener('pointerup', onUp);
-    window.removeEventListener('pointercancel', onUp);
+    clearListeners();
     if (drag) endDrag();
+  };
+  const onCancel = () => {
+    clearListeners();
+    if (drag) cancelPointerDrag();
   };
   window.addEventListener('pointermove', onMove);
   window.addEventListener('pointerup', onUp);
-  window.addEventListener('pointercancel', onUp);
+  window.addEventListener('pointercancel', onCancel);
 }
 
 function beginDrag(card, e) {
   const grid = card.parentNode;
   const rect = card.getBoundingClientRect();
+  const originIndex = gridAppCards(grid).indexOf(card);
   const ph = el('div', 'drop-placeholder');
   ph.style.height = rect.height + 'px';
   grid.insertBefore(ph, card);
@@ -662,7 +792,11 @@ function beginDrag(card, e) {
   s.pointerEvents = 'none';          // 穿透，便于 elementFromPoint 找目标
   card.classList.add('lifted');
   document.body.classList.add('dragging-on');
-  drag = { card, ph, grid, dx: e.clientX - rect.left, dy: e.clientY - rect.top };
+  drag = {
+    card, ph, grid, originIndex,
+    dx: e.clientX - rect.left,
+    dy: e.clientY - rect.top,
+  };
   moveDrag(e);
 }
 
@@ -689,20 +823,48 @@ function moveDrag(e) {
   }
 }
 
+function resetPointerDragCard(d) {
+  const s = d.card.style;
+  s.position = s.left = s.top = s.width = s.height = s.margin =
+    s.zIndex = s.transform = s.transition = s.pointerEvents = '';
+  d.card.classList.remove('lifted');
+  document.body.classList.remove('dragging-on');
+}
+
+function cancelPointerDrag() {
+  const d = drag;
+  drag = null;
+  const remaining = gridAppCards(d.grid);
+  const anchor = remaining[d.originIndex] || null;
+  if (anchor) d.grid.insertBefore(d.card, anchor);
+  else d.grid.appendChild(d.card);
+  d.ph.remove();
+  resetPointerDragCard(d);
+  d.card.focus({ preventScroll: true });
+  announceReorder('已取消排序，顺序未保存');
+}
+
+/* drop 瞬间的最终顺序：卡片脱离 grid 时占位框位置即目标位置。
+   必须在 180ms 滑入动画开始前快照——动画窗口内轮询可能按服务端旧顺序
+   重排 DOM，届时重读 DOM 会把被撤销的顺序 POST 回去，排序静默丢失。 */
+function dragDropOrder(d) {
+  const ids = gridAppCards(d.grid).map(card => card.dataset.key);
+  const children = [...d.grid.children];
+  const before = children.slice(0, children.indexOf(d.ph))
+    .filter(child => child.matches('.app-card[data-key]')).length;
+  ids.splice(before, 0, d.card.dataset.key);
+  return ids;
+}
+
 function endDrag() {
   const d = drag;
   drag = null;
+  const orderSnapshot = dragDropOrder(d);
   const finish = () => {
     d.grid.insertBefore(d.card, d.ph);
     d.ph.remove();
-    const s = d.card.style;
-    s.position = s.left = s.top = s.width = s.height = s.margin =
-      s.zIndex = s.transform = s.transition = s.pointerEvents = '';
-    d.card.classList.remove('lifted');
-    document.body.classList.remove('dragging-on');
-    const ids = [...d.grid.querySelectorAll('.app-card:not(.add-card)')]
-      .map(c => c.dataset.key);
-    post('/api/apps/reorder', { ids }).then(() => window.__poll());
+    resetPointerDragCard(d);
+    persistGridOrder(orderSnapshot);
   };
   if (reduceMotion) { finish(); return; }
   const t = d.ph.getBoundingClientRect();   // 滑入占位框
@@ -711,45 +873,211 @@ function endDrag() {
   setTimeout(finish, 180);
 }
 
-/* ---------------- 黑色 hero 卡（Candy 主题专用，其他主题 CSS 隐藏） ---------------- */
-let heroEl = null;
-function heroCard() {
-  if (heroEl) return heroEl;
-  heroEl = el('div', 'app-hero');
-  const title = el('div', 'hero-title');
-  title.textContent = '本地指挥中心';
-  const titleEn = el('span');
-  titleEn.textContent = 'LOCAL OPS';
-  title.append(titleEn);
-  const add = el('button', 'hero-add');
-  add.type = 'button';
-  add.textContent = '命令面板 ⌘K';
-  add.addEventListener('click', () => window.__openPalette && window.__openPalette());
-  const media = el('div', 'hero-media');
-  const art = new Image();
-  art.className = 'hero-art';
-  art.src = '/assets/local-ops-bot.webp';
-  art.alt = '';
-  art.width = 1000;
-  art.height = 722;
-  art.decoding = 'async';
-  art.loading = 'lazy';
-  art.draggable = false;
-  art.setAttribute('aria-hidden', 'true');
-  media.append(art);
-  const foot = el('div', 'hero-foot');
-  foot.textContent = 'SERVICES / AUTOMATION';
-  heroEl.append(title, add, media, foot);
-  return heroEl;
+function cardSortKeyDown(e) {
+  if (e.target !== e.currentTarget) return;
+  const card = e.currentTarget;
+  const isSpace = e.key === ' ' || e.key === 'Spacebar';
+  if (!keyboardSort) {
+    if (!isSpace) return;
+    e.preventDefault();
+    const grid = card.parentNode;
+    const cards = gridAppCards(grid);
+    keyboardSort = {
+      card,
+      grid,
+      originalIds: cards.map(item => item.dataset.key),
+    };
+    card.classList.add('keyboard-sorting');
+    const position = cards.indexOf(card) + 1;
+    announceReorder('已抓取 ' + (findApp(card.dataset.key)?.name || '应用') +
+      '，当前位置 ' + position + '，共 ' + cards.length + ' 项');
+    return;
+  }
+  if (keyboardSort.card !== card) return;
+  if (isSpace || e.key === 'Enter') {
+    e.preventDefault();
+    finishKeyboardSort(true);
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    finishKeyboardSort(false);
+    return;
+  }
+  const direction = (e.key === 'ArrowLeft' || e.key === 'ArrowUp') ? -1
+    : (e.key === 'ArrowRight' || e.key === 'ArrowDown') ? 1 : 0;
+  if (!direction) return;
+  e.preventDefault();
+  moveKeyboardSort(direction);
+}
+
+function moveKeyboardSort(direction) {
+  const { card, grid } = keyboardSort;
+  const cards = gridAppCards(grid);
+  const current = cards.indexOf(card);
+  const targetIndex = Math.max(0, Math.min(cards.length - 1, current + direction));
+  if (targetIndex === current) {
+    announceReorder(direction < 0 ? '已经是第一项' : '已经是最后一项');
+    return;
+  }
+  const target = cards[targetIndex];
+  flip(grid, () => {
+    if (direction < 0) grid.insertBefore(card, target);
+    else grid.insertBefore(card, target.nextSibling);
+  });
+  card.focus({ preventScroll: true });
+  announceReorder((findApp(card.dataset.key)?.name || '应用') +
+    ' 已移动到第 ' + (targetIndex + 1) + ' 项，共 ' + cards.length + ' 项');
+}
+
+function finishKeyboardSort(commit) {
+  const session = keyboardSort;
+  keyboardSort = null;
+  if (!commit) {
+    const byId = new Map(gridAppCards(session.grid)
+      .map(card => [card.dataset.key, card]));
+    for (const id of session.originalIds) {
+      const card = byId.get(id);
+      if (card) session.grid.appendChild(card);
+    }
+  }
+  session.card.classList.remove('keyboard-sorting');
+  session.card.focus({ preventScroll: true });
+  if (commit) {
+    persistGridOrder(gridAppCards(session.grid).map(card => card.dataset.key));
+    announceReorder('排序已保存');
+  } else {
+    announceReorder('已取消排序，顺序未保存');
+  }
 }
 
 export function renderLaunchpad(apps, firstRender) {
-  if (drag) return;  // 拖拽中轮询不打乱 DOM
+  if (drag || keyboardSort) return;  // 排序中轮询不打乱 DOM
   const svcs = apps.filter(a => (a.kind || 'service') !== 'task');
   const tasks = apps.filter(a => a.kind === 'task');
+  const addSvc = $('#addSvcCard');
+  const addTask = $('#addTaskCard');
+  addSvc.remove();
+  addTask.remove();
   reconcile(svcGrid, svcs, a => a.id, createAppCard, updateAppCard, firstRender);
-  svcGrid.appendChild($('#addSvcCard'));   // 「+ 添加服务」始终位于网格末尾
-  svcGrid.prepend(heroCard());             // hero 卡固定在网格首位
+  svcGrid.prepend(addSvc);                  // 新增入口始终优先可见
   reconcile(taskGrid, tasks, a => a.id, createAppCard, updateAppCard, firstRender);
-  taskGrid.appendChild($('#addTaskCard')); // 「+ 添加任务」始终位于网格末尾
+  taskGrid.prepend(addTask);                // 批处理新增入口始终优先可见
+  renderLpKpi(apps, svcs, tasks);
+  latestSvcs = svcs;
+  latestTasks = tasks;
+  syncSvcFilterUI();
+  syncTaskFilterUI();
+  setText($('#svcSecCount'), svcs.length ? String(svcs.length) : '');
+  setText($('#taskSecCount'), tasks.length ? String(tasks.length) : '');
+}
+
+function syncSvcFilterUI() {
+  renderFilterChips($('#svcFilter'), SVC_FILTERS, latestSvcs, svcFilter, matchSvcFilter,
+    f => { svcFilter = f; syncSvcFilterUI(); });
+  applyGridFilter(svcGrid, latestSvcs, matchSvcFilter, svcFilter);
+}
+function syncTaskFilterUI() {
+  renderFilterChips($('#taskFilter'), TASK_FILTERS, latestTasks, taskFilter, matchTaskFilter,
+    f => { taskFilter = f; syncTaskFilterUI(); });
+  applyGridFilter(taskGrid, latestTasks, matchTaskFilter, taskFilter);
+}
+
+/* ---------------- 启动台 KPI ---------------- */
+function renderLpKpi(apps, svcs, tasks) {
+  const running = apps.filter(a => a.running).length;
+  setKpi($('#lpStatApps'), String(apps.length));
+  setText($('#lpStatAppsSub'),
+    '运行 ' + running + ' · 停止 ' + (apps.length - running));
+  setKpi($('#lpStatRunning'), String(running));
+  setKpi($('#lpStatTasks'), String(tasks.length));
+  const runningTasks = tasks.filter(a => a.running).length;
+  setText($('#lpStatTasksSub'), runningTasks ? '运行中 ' + runningTasks : '空闲');
+  const warn = apps.filter(a => a.portOccupied).length;
+  setKpi($('#lpStatWarn'), String(warn));
+  $('#lpStatWarn').classList.toggle('bad', warn > 0);
+  setText($('#lpStatWarnSub'), warn ? '需要处理' : '无需处理');
+  /* 与「服务监控」同口径：我的服务负载合计 */
+  let cpuSum = 0, memSum = 0;
+  for (const s of ((state.data && state.data.services) || [])) {
+    if (s.group !== 'mine' || s.hidden) continue;
+    cpuSum += s.cpu || 0;
+    memSum += s.mem || 0;
+  }
+  setKpiUnit($('#lpStatCpu'), cpuSum.toFixed(1), '%');
+  setKpiUnit($('#lpStatMem'), memSum.toFixed(1), '%');
+  setText($('#lpStatCpuSub'), '负载' + loadLevel(cpuSum));
+  setText($('#lpStatMemSub'), '占用' + loadLevel(memSum));
+}
+
+function loadLevel(pct) {
+  return pct >= 80 ? '过高' : pct >= 50 ? '偏高' : '正常';
+}
+
+/* ---------------- 分区过滤芯片 ---------------- */
+const SVC_FILTERS = [['all', '全部'], ['running', '运行中'],
+  ['stopped', '已停止'], ['error', '异常']];
+const TASK_FILTERS = [['all', '全部'], ['running', '运行中'],
+  ['succeeded', '成功'], ['failed', '失败'], ['canceled', '已取消']];
+let svcFilter = 'all', taskFilter = 'all';
+/* 芯片按钮只创建一次，点击时必须读取当轮数据而不是首次渲染的闭包快照 */
+let latestSvcs = [], latestTasks = [];
+
+function svcHasError(app) {
+  if (app.portConflict || app.portOccupied || hasPortMismatch(app)) return true;
+  if (!app.running && app.health && app.health.blocking) return true;
+  if (!app.running && app.lastExit) {
+    const isTask = (app.kind || 'service') === 'task';
+    return isTask ? taskExitStatus(app.lastExit) === 'failed'
+      : app.lastExit.code !== 0;
+  }
+  return false;
+}
+function matchSvcFilter(app, filter) {
+  if (filter === 'running') return !!app.running;
+  if (filter === 'stopped') return !app.running;
+  if (filter === 'error') return svcHasError(app);
+  return true;
+}
+function matchTaskFilter(app, filter) {
+  if (filter === 'running') return !!app.running;
+  if (filter === 'all') return true;
+  if (app.running || !app.lastExit) return false;
+  const status = taskExitStatus(app.lastExit);
+  if (filter === 'canceled') return status === 'canceled' || status === 'stopped';
+  return status === filter;
+}
+
+function renderFilterChips(row, defs, apps, active, match, onPick) {
+  if (!row) return;
+  if (row._sig !== defs) {
+    row.replaceChildren();
+    row._sig = defs;
+    row._btns = new Map();
+    for (const [key, label] of defs) {
+      const btn = el('button', 'fchip');
+      btn.type = 'button';
+      const text = el('span');
+      text.textContent = label;
+      const count = el('span', 'fc-n');
+      btn.append(text, count);
+      btn.addEventListener('click', () => onPick(key));
+      row.appendChild(btn);
+      row._btns.set(key, { btn, count });
+    }
+  }
+  for (const [key] of defs) {
+    const item = row._btns.get(key);
+    item.btn.classList.toggle('active', key === active);
+    setText(item.count, String(apps.filter(a => match(a, key)).length));
+  }
+}
+
+function applyGridFilter(grid, apps, match, filter) {
+  if (!grid) return;
+  const byId = new Map(apps.map(a => [a.id, a]));
+  for (const card of grid.querySelectorAll('.app-card[data-key]')) {
+    const app = byId.get(card.dataset.key);
+    card.hidden = app ? !match(app, filter) : false;
+  }
 }

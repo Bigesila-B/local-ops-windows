@@ -29,6 +29,18 @@ export function setKpi(node, txt) {
   void node.offsetWidth;
   node.classList.remove('flash');
 }
+/* 带缩小单位的 KPI 数字（%、秒）：主体与整数同号，单位以 .unit 缩小弱化 */
+export function setKpiUnit(node, txt, unit) {
+  const sig = txt + '|' + unit;
+  if (node._t === sig) return;
+  node._t = sig;
+  const u = el('span', 'unit');
+  u.textContent = unit;
+  setChildren(node, document.createTextNode(txt), u);
+  node.classList.add('flash');
+  void node.offsetWidth;
+  node.classList.remove('flash');
+}
 export function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -39,6 +51,15 @@ export function truncateMiddle(s, max = 34) {
   if (s.length <= max) return s;
   const keep = max - 1;
   return s.slice(0, Math.ceil(keep / 2)) + '…' + s.slice(-Math.floor(keep / 2));
+}
+/* 后端根据真实 bind address 返回 openHost；旧后端缺字段时保持原行为。 */
+export function localServiceUrl(item, port) {
+  const value = Number(port);
+  if (!Number.isInteger(value) || value <= 0 || value > 65535) return '';
+  let host = item && item.openHosts && item.openHosts[String(value)];
+  if (!host && item) host = item.openHost;
+  host = host === 'localhost' ? 'localhost' : '127.0.0.1';
+  return 'http://' + host + ':' + value;
 }
 /* 秒 → 刚刚 / Nm / NhNm / NdNh */
 export function fmtUptime(sec) {
@@ -104,6 +125,11 @@ export const GLYPHS = ['rocket', 'globe', 'terminal', 'server', 'database', 'bot
 /* ---------------- API ---------------- */
 const REQUEST_TIMEOUT_MS = 12000;
 
+/* 变更代际：每次写操作成功后 +1。轮询响应到达时若代际已变，说明数据
+   是操作生效前发出的旧快照，前端会丢弃并立即补一轮，避免旧状态回退。 */
+let mutationEpoch = 0;
+export function currentMutationEpoch() { return mutationEpoch; }
+
 async function req(method, path, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -114,7 +140,7 @@ async function req(method, path, body) {
   }
   try {
     const r = await fetch(path, opt);
-    if (r.status === 204) return { ok: true };
+    if (r.status === 204) { mutationEpoch += 1; return { ok: true }; }
     const type = r.headers.get('content-type') || '';
     const fallbackError = r.status === 401 || r.status === 403
       ? '访问被拒绝，请从总控台页面重试'
@@ -125,6 +151,7 @@ async function req(method, path, body) {
     if (!r.ok && (!data || data.ok !== false)) {
       return { ok: false, error: (data && data.error) || fallbackError };
     }
+    mutationEpoch += 1;
     return data;
   } catch (e) {
     if (e.name === 'AbortError') throw new Error('请求超时，请稍后重试');
@@ -165,11 +192,18 @@ export function toast(msg, duration = 3200) {
 
 /* ---------------- 浮层焦点管理 ---------------- */
 const layerReturnFocus = new WeakMap();
+/* 浮层（含日志抽屉）都在 .shell 之外；打开时把背景置 inert，
+   读屏与 Tab 都无法触达背景内容，符合 APG 对话框模式。 */
+function setShellInert(value) {
+  const shell = document.querySelector('.shell');
+  if (shell) shell.inert = value;
+}
 export function openLayer(layer, focusTarget) {
   layerReturnFocus.set(layer, document.activeElement);
   layer.inert = false;
   layer.setAttribute('aria-hidden', 'false');
   layer.classList.add('open');
+  setShellInert(true);
   setTimeout(() => {
     const target = typeof focusTarget === 'function' ? focusTarget() : focusTarget;
     if (target) target.focus();
@@ -182,10 +216,12 @@ export function closeLayer(layer) {
   layer.inert = true;
   const target = layerReturnFocus.get(layer);
   layerReturnFocus.delete(layer);
+  if (!activeLayer()) setShellInert(false);
   if (target && target.isConnected) setTimeout(() => target.focus(), 0);
 }
-const LAYER_IDS = ['#confirmMask', '#themeMask', '#portDiagMask',
-  '#appDiagMask', '#appModalMask', '#paletteMask', '#logDrawer'];
+const LAYER_IDS = ['#confirmMask', '#portDiagMask',
+  '#appDiagMask', '#appModalMask', '#paletteMask', '#logDrawer',
+  '#logsMask', '#settingsMask'];
 export function activeLayer() {
   for (const id of LAYER_IDS) {
     const layer = $(id);
@@ -241,7 +277,6 @@ export const state = {
   view: localStorage.getItem('console-view') === 'services' ? 'services' : 'launchpad',
   data: null,
   lastUpdate: null,
-  connected: true,
   restartingFrom: null,
   stopping: false,
 };
@@ -252,9 +287,61 @@ export function findApp(id) {
 }
 export function taskExitSignature(lastExit) {
   if (!lastExit) return '';
-  return [lastExit.startedAt || '', lastExit.at || '', lastExit.code,
+  return [lastExit.status || '', lastExit.startedAt || '', lastExit.at || '', lastExit.code,
     lastExit.durationSec == null ? '' : lastExit.durationSec].join('|');
 }
+export function taskExitStatus(lastExit) {
+  if (!lastExit) return '';
+  if (['succeeded', 'canceled', 'failed', 'stopped'].includes(lastExit.status)) {
+    return lastExit.status;
+  }
+  if (lastExit.code === 0) return 'succeeded';
+  if (lastExit.code === 130) return 'canceled';
+  return 'failed';
+}
+/* ---------------- 任务完成系统通知 ---------------- */
+const TASK_NOTIFY_KEY = 'console-task-notify';
+export function taskNotificationsEnabled() {
+  if (typeof Notification === 'undefined') return false;
+  return localStorage.getItem(TASK_NOTIFY_KEY) === '1'
+    && Notification.permission === 'granted';
+}
+export async function toggleTaskNotifications() {
+  if (typeof Notification === 'undefined') {
+    toast('当前浏览器不支持系统通知');
+    return false;
+  }
+  if (Notification.permission === 'default') {
+    const granted = await Notification.requestPermission();
+    if (granted !== 'granted') {
+      toast('未获得系统通知权限');
+      return false;
+    }
+  }
+  if (Notification.permission !== 'granted') {
+    toast('系统通知被拒绝，请在浏览器设置中允许后重试');
+    return false;
+  }
+  const enabled = taskNotificationsEnabled();
+  if (enabled) {
+    localStorage.removeItem(TASK_NOTIFY_KEY);
+    toast('已关闭任务完成通知');
+  } else {
+    localStorage.setItem(TASK_NOTIFY_KEY, '1');
+    toast('已开启任务完成通知');
+  }
+  return !enabled;
+}
+function systemNotify(title, body) {
+  if (!document.hidden || !taskNotificationsEnabled()) return;
+  try {
+    const n = new Notification(title, { body, tag: 'console-task' });
+    if (n) setTimeout(() => n.close(), 10000);
+  } catch (e) {
+    /* 某些环境构造 Notification 会抛异常；通知是锦上添花，静默失败。 */
+  }
+}
+
 /* 只提醒本页打开期间新完成的任务；首次加载已有历史时保持安静。 */
 export function notifyTaskCompletions(previousData, nextData) {
   if (!previousData) return;
@@ -263,15 +350,28 @@ export function notifyTaskCompletions(previousData, nextData) {
     if (app.kind !== 'task' || !app.lastExit) continue;
     const before = previous.get(app.id);
     if (!before || taskExitSignature(before.lastExit) === taskExitSignature(app.lastExit)) continue;
+    const status = taskExitStatus(app.lastExit);
+    /* 手动中止已经由发起操作即时提示，不在轮询时重复提醒。 */
+    if (status === 'stopped') continue;
     const duration = fmtDuration(app.lastExit.durationSec);
     const suffix = duration ? '，用时 ' + duration : '';
-    if (app.lastExit.code === 0) {
-      toast((app.name || '批处理任务') + '运行成功' + suffix, 5000);
+    const name = app.name || '批处理任务';
+    if (status === 'succeeded') {
+      toast(name + '运行成功' + suffix, 5000);
+    } else if (status === 'canceled') {
+      toast(name + '已取消' + suffix, 4200);
     } else {
       const result = app.lastExit.code < 0
         ? '被终止' : '运行失败（exit ' + app.lastExit.code + '）';
-      toast((app.name || '批处理任务') + result + suffix + '，可查看日志', 6500);
+      toast(name + result + suffix + '，可查看日志', 6500);
     }
+    /* 页面不可见时 toast 无人看到，改用系统通知（浏览器会显示在桌面）。 */
+    const notifyBody = {
+      succeeded: '运行成功' + suffix,
+      canceled: '已取消' + suffix,
+      failed: (app.lastExit.code < 0 ? '被终止' : '运行失败') + suffix,
+    }[status];
+    systemNotify(name + ' · 任务完成', notifyBody || '任务已结束');
   }
 }
 
@@ -313,18 +413,18 @@ export function reconcilePendingUiTheme(data) {
 }
 export function currentUiTheme() {
   const candidate = (state.data && state.data.uiTheme)
-    || localStorage.getItem('console-ui-theme') || 'apollo';
+    || localStorage.getItem('console-ui-theme') || 'ops';
   const themes = registeredThemes();
   if (themes.length) {
     if (themes.some(theme => theme.id === candidate)) return candidate;
-    return (themes.find(theme => theme.id === 'apollo') || themes[0]).id;
+    return (themes.find(theme => theme.id === 'ops') || themes[0]).id;
   }
-  return /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(candidate) ? candidate : 'apollo';
+  return /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(candidate) ? candidate : 'ops';
 }
 
 function linkedThemeName(link) {
   const match = (link.getAttribute('href') || '').match(/\/themes\/([^/?]+)\.css/);
-  return match ? decodeURIComponent(match[1]) : 'apollo';
+  return match ? decodeURIComponent(match[1]) : 'ops';
 }
 
 function loadThemeCss(name) {
@@ -362,6 +462,12 @@ function commitUiTheme(name) {
 let themeChangeQueue = Promise.resolve(true);
 let pendingThemeChange = null;
 export function applyUiTheme(name, persist = false) {
+  /* 目标主题已是当前应用值且无待办任务时直接返回，避免 render() 每 2s
+     往 themeChangeQueue 链上追加节点（长时间挂机会累积数万个闭包）。 */
+  if (!persist && !pendingThemeChange && !pendingPersistedUiTheme
+      && document.documentElement.dataset.uiTheme === name) {
+    return Promise.resolve(true);
+  }
   if (pendingThemeChange && pendingThemeChange.name === name
       && (!persist || pendingThemeChange.persist)) {
     return pendingThemeChange.promise;
@@ -407,50 +513,4 @@ export function applyUiTheme(name, persist = false) {
   });
   return queued;
 }
-export function openThemePicker() {
-  renderThemeGrid();
-  openLayer($('#themeMask'), $('#themeMaskClose'));
-}
-export function closeThemePicker() { closeLayer($('#themeMask')); }
-function renderThemeGrid() {
-  const themeGrid = $('#themeGrid');
-  themeGrid.replaceChildren();
-  for (const t of registeredThemes()) {
-    const card = el('button', 'theme-card' + (t.id === currentUiTheme() ? ' sel' : ''));
-    card.type = 'button';
-    card.setAttribute('aria-pressed', String(t.id === currentUiTheme()));
-    const dots = el('span', 'theme-dots');
-    for (const c of t.colors || []) {
-      const d = el('i');
-      d.style.background = c;
-      dots.appendChild(d);
-    }
-    const name = el('span', 'theme-name');
-    name.textContent = t.name;
-    const author = el('span', 'theme-author');
-    author.textContent = t.author ? 'by ' + t.author : '';
-    const desc = el('span', 'theme-desc');
-    desc.textContent = t.desc || '';
-    card.append(dots, name, author, desc);
-    card.addEventListener('click', async () => {
-      card.disabled = true;
-      const changed = await applyUiTheme(t.id, true);
-      card.disabled = false;
-      if (!changed) return;
-      closeThemePicker();
-      toast('已切换到 ' + t.name);
-    });
-    themeGrid.appendChild(card);
-  }
-}
-export function initThemePicker() {
-  const uiThemeBtn = $('#uiThemeBtn');
-  setChildren(uiThemeBtn, icon('sliders-horizontal', 15));
-  uiThemeBtn.title = '选择主题';
-  uiThemeBtn.setAttribute('aria-label', '选择主题');
-  uiThemeBtn.addEventListener('click', openThemePicker);
-  $('#themeMaskClose').addEventListener('click', closeThemePicker);
-  $('#themeMask').addEventListener('mousedown', e => {
-    if (e.target === $('#themeMask')) closeThemePicker();
-  });
-}
+

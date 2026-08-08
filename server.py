@@ -69,6 +69,9 @@ INSTANCE_LOCK_PATH = os.path.join(DATA_DIR, "console.lock")
 
 CURRENT_SCHEMA_VERSION = 1
 
+# 默认 UI 主题：新安装与无偏好回退均使用它，主题清单中固定排首位。
+DEFAULT_UI_THEME = "ops"
+
 
 def read_project_version(path=VERSION_PATH):
     """读取根目录 VERSION。失败时保持服务可诊断，但标记为降级。"""
@@ -100,6 +103,7 @@ STARTUP_PROBE_SEC = 0.25
 APP_STOP_TIMEOUT_SEC = 5.0
 RUN_TOKEN_ENV = "CONSOLE_RUN_TOKEN"
 RUN_TOKEN_ARG_PREFIX = "console-run:"
+TASK_CANCELED_EXIT_CODE = 130
 
 SELF_PID = os.getpid()
 SELF_UID = os.getuid()
@@ -108,6 +112,33 @@ LOG = logging.getLogger("console")
 LOG_LOCK = threading.RLock()
 MANUAL_STOP_LOCK = threading.RLock()
 MANUAL_STOP_TOKENS = set()
+
+
+def classify_task_exit(code):
+    """把一次性任务的退出码归一为稳定的产品语义。"""
+    if code == 0:
+        return "succeeded"
+    if code == TASK_CANCELED_EXIT_CODE:
+        return "canceled"
+    return "failed"
+
+
+def public_last_exit(app):
+    """兼容旧配置：只在 API 输出时补齐任务状态，不改写磁盘。"""
+    value = app.get("lastExit")
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    if (app.get("kind") or "service") == "task":
+        # 旧版把“总控台按钮停止”记作 canceled + null；新协议中它是 stopped。
+        if result.get("status") == "canceled" and result.get("code") is None:
+            result["status"] = "stopped"
+        elif (result.get("status") not in
+              {"succeeded", "canceled", "failed", "stopped"}
+              and isinstance(result.get("code"), int)):
+            result["status"] = classify_task_exit(result["code"])
+    return result
+
 
 STATIC_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -140,7 +171,7 @@ code{background:#f5f5f7;border:1px solid rgba(0,0,0,.05);border-radius:6px;paddi
 </div></body></html>"""
 
 APP_ROUTE_RE = re.compile(
-    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose))?$")
+    r"^/api/apps/([0-9a-fA-F]{8})(?:/(start|stop|restart|icon|logs|favicon|diagnose|attach))?$")
 
 
 # ---------------------------------------------------------------- 运行目录
@@ -353,12 +384,12 @@ class Config:
 
     DEFAULT = {"schemaVersion": CURRENT_SCHEMA_VERSION,
                "apps": [], "hidden": [], "pinned": [], "promoted": [],
-               "watchedKeywords": [], "uiTheme": "apollo"}
+               "watchedKeywords": [], "uiTheme": DEFAULT_UI_THEME}
     APP_DEFAULT = {"id": None, "name": "", "command": "", "cwd": None,
                    "port": None, "emoji": None, "glyph": None, "icon": None,
                    "favicon": None, "kind": "service", "lastPid": None,
                    "lastPgid": None, "runToken": None,
-                   "lastExit": None, "createdAt": 0}
+                   "attached": False, "lastExit": None, "createdAt": 0}
 
     def __init__(self, path):
         self._lock = threading.RLock()
@@ -485,6 +516,7 @@ class Config:
                 # 先保存上一份良好内容，再替换主文件。
                 self._write_atomic(self._path + ".bak", previous_payload)
                 self._write_atomic(self._path, payload)
+                invalidate_state_cache()
                 return result
             except Exception:
                 self._data = previous
@@ -585,7 +617,11 @@ def _to_float(tok, default=0.0):
 
 
 def scan_listeners():
-    """lsof -iTCP -sTCP:LISTEN -P -n → {(pid, port), ...}，按 (pid,port) 去重。"""
+    """lsof 监听快照 → {(pid, port): {bind_host, ...}}。
+
+    字典仍可像旧集合一样迭代/判断 ``(pid, port)``，同时保留监听地址，
+    供前端区分仅监听 ``::1`` 的服务（需通过 localhost 打开）。
+    """
     out = run_cmd(["lsof", "-iTCP", "-sTCP:LISTEN", "-P", "-n"])
     found = {}
     for line in out.splitlines():
@@ -600,15 +636,47 @@ def scan_listeners():
             continue
         # NAME 列形如 *:8791 / 127.0.0.1:8080 / [::1]:8765，末尾可能跟 "(LISTEN)"
         port = None
+        bind_host = None
         for tok in reversed(parts):
             m = re.search(r":(\d+)$", tok)
             if m:
                 port = int(m.group(1))
+                bind_host = tok[:m.start()]
+                if bind_host.startswith("[") and bind_host.endswith("]"):
+                    bind_host = bind_host[1:-1]
                 break
         if port is None:
             continue
-        found[(pid, port)] = True
+        found.setdefault((pid, port), set()).add(bind_host or "")
     return found
+
+
+def listener_open_host(listeners, port, pids=None):
+    """返回浏览器访问监听端口时应使用的本地主机名。
+
+    macOS 上有些开发服务器只绑定 IPv6 回环 ``::1``；这时
+    ``127.0.0.1`` 会直接拒绝连接，而 ``localhost`` 能正确解析到它。
+    对旧测试/旧调用传入的 set 快照则保持原来的 IPv4 默认值。
+    """
+    if not isinstance(listeners, dict):
+        return "127.0.0.1"
+    allowed_pids = set(pids) if pids is not None else None
+    hosts = set()
+    for (pid, listening_port), values in listeners.items():
+        if listening_port != port or (
+                allowed_pids is not None and pid not in allowed_pids):
+            continue
+        if isinstance(values, str):
+            hosts.add(values)
+        elif isinstance(values, (set, list, tuple)):
+            hosts.update(value for value in values if isinstance(value, str))
+    normalized = {host.strip("[]").casefold() for host in hosts if host}
+    ipv4_capable = any(
+        host in ("*", "0.0.0.0") or host.startswith("127.")
+        for host in normalized)
+    ipv6_loopback_only = bool(normalized) and not ipv4_capable and all(
+        host in ("::", "::1", "localhost") for host in normalized)
+    return "localhost" if ipv6_loopback_only else "127.0.0.1"
 
 
 def ps_snapshot(pids=None, with_uid=True):
@@ -742,7 +810,129 @@ def project_name(cwd):
     return os.path.basename(cwd) or None
 
 
-def build_services(cfg):
+# ---------------------------------------------------------------- 进程溯源
+# 沿 PPID 链向上识别「是谁启动了这个服务」：AI 编程助手、编辑器、终端、
+# 总控台自身或 launchd。结果只是展示用的尽力判断，不影响任何启停逻辑。
+
+# 向上爬时要跳过的包装层（按 argv[0] 基名匹配）：壳、包管理器与任务执行器
+_ORIGIN_SKIP_NAMES = {
+    "zsh", "bash", "sh", "dash", "fish", "login", "su", "sudo", "env",
+    "command", "xargs", "nohup", "setsid", "script", "expect", "caffeinate",
+    "launchd",
+    "npm", "npx", "pnpm", "yarn", "corepack", "make", "just",
+    "node", "tsx", "nodemon", "deno", "bun", "bunx",
+    "python", "python3", "uv", "poetry", "pip", "pipx",
+    "ruby", "php", "java", "dotnet", "go", "cargo",
+}
+
+# 已知 AI 编程助手签名（在祖先 args 中做词边界匹配，按顺序取先命中者）
+_ORIGIN_AGENT_PATTERNS = (
+    (re.compile(r"\bcodex\b", re.I), "Codex"),
+    (re.compile(r"claude-code|\bclaude\b", re.I), "Claude Code"),
+    (re.compile(r"\bkimi\b", re.I), "Kimi"),
+    (re.compile(r"\bgemini\b", re.I), "Gemini"),
+    (re.compile(r"\baider\b", re.I), "Aider"),
+    (re.compile(r"\bopencode\b", re.I), "OpenCode"),
+    (re.compile(r"\bgoose\b", re.I), "Goose"),
+    (re.compile(r"\bcursor-agent\b", re.I), "Cursor"),
+    (re.compile(r"\bcopilot\b", re.I), "Copilot"),
+    (re.compile(r"\bqwen\b", re.I), "Qwen"),
+    (re.compile(r"\bqoder\b", re.I), "Qoder"),
+    (re.compile(r"\bamp\b", re.I), "Amp"),
+    (re.compile(r"\bcodebuddy\b", re.I), "CodeBuddy"),
+)
+
+# .app 包名 → (展示名, 图标)。未列出的包按原名 + package 图标展示
+_ORIGIN_APP_ALIASES = {
+    "visual studio code": ("VS Code", "code"),
+    "visual studio code - insiders": ("VS Code", "code"),
+    "cursor": ("Cursor", "code"),
+    "trae": ("Trae", "code"),
+    "windsurf": ("Windsurf", "code"),
+    "zed": ("Zed", "code"),
+    "sublime text": ("Sublime", "code"),
+    "webstorm": ("WebStorm", "code"),
+    "intellij idea": ("IDEA", "code"),
+    "goland": ("GoLand", "code"),
+    "pycharm": ("PyCharm", "code"),
+    "nova": ("Nova", "code"),
+    "xcode": ("Xcode", "code"),
+    "iterm2": ("iTerm", "terminal"),
+    "iterm": ("iTerm", "terminal"),
+    "terminal": ("终端", "terminal"),
+    "warp": ("Warp", "terminal"),
+    "kitty": ("kitty", "terminal"),
+    "alacritty": ("Alacritty", "terminal"),
+    "wezterm": ("WezTerm", "terminal"),
+    "docker": ("Docker", "package"),
+    "ollama": ("Ollama", "package"),
+    "obsidian": ("Obsidian", "package"),
+}
+_ORIGIN_BUNDLE_RE = re.compile(r"/([^/]+)\.app/Contents/MacOS/", re.I)
+
+# 终端复用器（直接以 comm 命名，不进跳过表）
+_ORIGIN_MULTIPLEXERS = {"tmux": "tmux", "screen": "screen"}
+
+
+def origin_snapshot():
+    """ps -axo pid=,ppid=,args → {pid: (ppid, args)}，供来源溯源。"""
+    table = {}
+    for line in run_cmd(["ps", "-axo", "pid=,ppid=,args"]).splitlines():
+        toks = line.split(None, 2)
+        if len(toks) < 2:
+            continue
+        try:
+            pid, ppid = int(toks[0]), int(toks[1])
+        except ValueError:
+            continue
+        table[pid] = (ppid, toks[2] if len(toks) > 2 else "")
+    return table
+
+
+def attribute_origin(pid, table):
+    """沿 PPID 链识别来源应用，返回 {"label", "icon"} 或 None。
+
+    祖先 args 中带有总控台 run-token 前缀（console-run:）即判定为
+    「总控台启动」——本机任一总控台实例的受管进程组都持有该标记。
+    未识别的中间层先记为候选并继续上爬；AI 助手 / 编辑器 / 终端 /
+    总控台 / launchd 是更优答案，都没有时才以最近的未识别进程命名。
+    最多上爬 12 层，遇到环或缺失即终止。
+    """
+    cur, seen, candidate = pid, set(), None
+    for _ in range(12):
+        entry = table.get(cur)
+        if not entry:
+            break
+        ppid, _ = entry
+        if ppid in seen:
+            break
+        seen.add(ppid)
+        parent_args = (table.get(ppid) or (0, ""))[1] or ""
+        if ppid <= 1:
+            return candidate or {"label": "系统", "icon": "server"}
+        if RUN_TOKEN_ARG_PREFIX in parent_args:
+            return {"label": "总控台", "icon": "rocket"}
+        hay = parent_args.casefold()
+        for pattern, label in _ORIGIN_AGENT_PATTERNS:
+            if pattern.search(hay):
+                return {"label": label, "icon": "bot"}
+        bundle = _ORIGIN_BUNDLE_RE.search(parent_args)
+        if bundle:
+            app_name = bundle.group(1)
+            label, icon = _ORIGIN_APP_ALIASES.get(
+                app_name.casefold(), (app_name, "package"))
+            return {"label": label, "icon": icon}
+        base = os.path.basename(
+            parent_args.split()[0]).lstrip("-") if parent_args.split() else ""
+        if base in _ORIGIN_MULTIPLEXERS:
+            return {"label": _ORIGIN_MULTIPLEXERS[base], "icon": "terminal"}
+        if base and base not in _ORIGIN_SKIP_NAMES and candidate is None:
+            candidate = {"label": base, "icon": "package"}
+        cur = ppid
+    return candidate
+
+
+def build_services(cfg, groups=None):
     """返回 (services, listeners)。只含当前用户进程，排除控制台自身。"""
     listeners = scan_listeners()
     snap = ps_snapshot({pid for pid, _ in listeners}, with_uid=True)
@@ -750,17 +940,15 @@ def build_services(cfg):
                  if pid != SELF_PID and pid in snap
                  and snap[pid].get("uid") == SELF_UID]
     cwds = lsof_cwds(mine_pids)
+    origin_table = origin_snapshot()
 
     hidden = set(cfg.get("hidden") or [])
     pinned = set(cfg.get("pinned") or [])
     promoted = set(cfg.get("promoted") or [])
-    # 只关联唯一配置的端口；重复端口不猜测属于哪张应用卡。
-    apps_by_port = {}
-    for candidate in cfg.get("apps") or []:
-        if candidate.get("port"):
-            apps_by_port.setdefault(candidate["port"], []).append(candidate)
-    app_by_port = {port: items[0] for port, items in apps_by_port.items()
-                   if len(items) == 1}
+    # “配置了相同端口”不代表“拥有当前监听进程”。只有 run token / 进程组
+    # 校验通过（或严格命中旧版身份）的进程才关联启动台卡片。
+    app_by_pid = listener_app_owners(
+        cfg.get("apps") or [], listeners, snap, cwds, groups)
 
     services = []
     for pid, port in sorted(listeners, key=lambda x: (x[1], x[0])):
@@ -774,9 +962,14 @@ def build_services(cfg):
         name = os.path.basename(comm) if comm else "?"
         key = "%s:%d" % (name, port)
         cwd = cwds.get(pid)
-        app = app_by_port.get(port)
+        app = app_by_pid.get(pid)
         services.append({
-            "key": key, "pid": pid, "name": name, "port": port,
+            "key": key,
+            # key 保持 name:port 以兼容既有隐藏/置顶配置；instanceKey 用于
+            # 区分同名同端口在不同时间出现的新进程，以及极少数共享监听。
+            "instanceKey": "%d:%d" % (pid, port),
+            "pid": pid, "name": name, "port": port,
+            "openHost": listener_open_host(listeners, port, {pid}),
             "cwd": cwd, "project": project_name(cwd), "cmd": args,
             "cpu": info["cpu"], "mem": info["mem"], "uptimeSec": info["etime"],
             "group": classify_group(key, name, comm, args, cwd, promoted),
@@ -784,31 +977,46 @@ def build_services(cfg):
             "promoted": key in promoted,
             "appId": app["id"] if app else None,
             "appName": app["name"] if app else None,
+            # 来源溯源（尽力判断）：哪个应用/AI 助手启动了这个进程
+            "origin": attribute_origin(pid, origin_table),
         })
     return services, listeners
 
 
 def build_watched(keywords):
-    """关注进程：args 小写包含关键字即命中；排除自身及 ps/lsof。"""
-    keywords = [k for k in (keywords or []) if isinstance(k, str) and k.strip()]
-    if not keywords:
+    """关注进程：每个 PID 只返回一次，并合并它命中的全部关键字。"""
+    normalized = []
+    seen_keywords = set()
+    for keyword in (keywords or []):
+        if not isinstance(keyword, str) or not keyword.strip():
+            continue
+        keyword = keyword.strip()
+        lowered = keyword.casefold()
+        if lowered in seen_keywords:
+            continue
+        seen_keywords.add(lowered)
+        normalized.append((keyword, lowered))
+    if not normalized:
         return []
     snap = ps_snapshot(None, with_uid=True)
     result = []
-    for kw in keywords:
-        kl = kw.lower()
-        for pid, info in snap.items():
-            if pid == SELF_PID or info.get("uid") != SELF_UID:
-                continue
-            name = os.path.basename(info.get("comm") or "") or "?"
-            if name in ("ps", "lsof"):
-                continue
-            args = info.get("args") or ""
-            if kl not in args.lower():
-                continue
-            result.append({"pid": pid, "name": name, "cmd": args,
-                           "cpu": info["cpu"], "mem": info["mem"],
-                           "uptimeSec": info["etime"], "keyword": kw})
+    for pid, info in sorted(snap.items()):
+        if pid == SELF_PID or info.get("uid") != SELF_UID:
+            continue
+        name = os.path.basename(info.get("comm") or "") or "?"
+        if name in ("ps", "lsof"):
+            continue
+        args = info.get("args") or ""
+        args_lower = args.casefold()
+        matched = [keyword for keyword, lowered in normalized
+                   if lowered in args_lower]
+        if not matched:
+            continue
+        result.append({"pid": pid, "name": name, "cmd": args,
+                       "cpu": info["cpu"], "mem": info["mem"],
+                       "uptimeSec": info["etime"],
+                       # keyword 保留给旧前端，keywords 提供无损结构化数据。
+                       "keyword": "、".join(matched), "keywords": matched})
     return result
 
 
@@ -876,76 +1084,110 @@ def managed_pids(app, groups=None):
 
 
 def legacy_managed_pid(app, listeners=None, snap=None, cwds=None):
-    """识别升级前已由总控台启动、但尚无 runToken 的监听进程。
+    """识别升级前身份或用户明确认领的外部监听进程。
 
-    只接受配置中原本记录的 lastPid，并同时校验端口、当前用户和真实 cwd；
-    不能满足全部条件时仍视为外部占用，绝不只凭端口认领进程。
+    普通旧数据仍只接受原 lastPid。明确 ``attached`` 的卡片允许监听子进程
+    换 PID，但仍必须在配置端口上按当前 UID + 真实 cwd 唯一命中；因此
+    Next/Vite 等重建子进程后不会丢失关联，也不会只凭端口误认其他项目。
     """
     if app.get("runToken"):
         return None
-    pid = app.get("lastPid")
+    recorded_pid = app.get("lastPid")
     port = app.get("port")
     expected_cwd = app.get("cwd")
-    if (not isinstance(pid, int) or pid <= 0
-            or not isinstance(port, int) or port <= 0
+    if (not isinstance(port, int) or port <= 0
             or not isinstance(expected_cwd, str) or not expected_cwd):
         return None
     if listeners is None:
         listeners = scan_listeners()
-    if (pid, port) not in listeners:
+    port_pids = {pid for pid, listening_port in listeners
+                 if listening_port == port}
+    if not app.get("attached"):
+        if not isinstance(recorded_pid, int) or recorded_pid <= 0:
+            return None
+        port_pids.intersection_update({recorded_pid})
+    if not port_pids:
         return None
     if snap is None:
-        snap = ps_snapshot({pid}, with_uid=True)
-    if snap.get(pid, {}).get("uid") != SELF_UID:
-        return None
+        snap = ps_snapshot(port_pids, with_uid=True)
     if cwds is None:
-        cwds = lsof_cwds({pid})
-    actual_cwd = cwds.get(pid)
-    if not actual_cwd:
-        return None
-    try:
-        if os.path.realpath(actual_cwd) != os.path.realpath(expected_cwd):
-            return None
-    except OSError:
-        return None
-    return pid
+        cwds = lsof_cwds(port_pids)
+    matches = []
+    for pid in sorted(port_pids):
+        if snap.get(pid, {}).get("uid") != SELF_UID:
+            continue
+        actual_cwd = cwds.get(pid)
+        if not actual_cwd:
+            continue
+        try:
+            same_cwd = (
+                os.path.realpath(actual_cwd) == os.path.realpath(expected_cwd))
+        except OSError:
+            same_cwd = False
+        if same_cwd:
+            matches.append(pid)
+    if recorded_pid in matches:
+        return recorded_pid
+    return matches[0] if app.get("attached") and len(matches) == 1 else None
 
 
-def build_apps(cfg, listeners):
+def listener_app_owners(apps, listeners, snap, cwds, groups=None):
+    """返回真实受管监听进程的 ``pid -> app`` 映射。
+
+    端口只是配置与网络资源，不能作为进程所有权证明。映射沿用应用状态的
+    run token / PGID / UID 校验，并为升级前的进程保留严格 legacy 识别。
+    如果异常配置让同一 PID 同时命中多张卡片，则不做关联，避免误导 UI。
+    """
+    managed, _, _ = managed_process_index(apps, groups)
+    candidates = {}
+    for app in apps:
+        live = managed.get(app.get("id"), [])
+        if not live:
+            legacy_pid = legacy_managed_pid(app, listeners, snap, cwds)
+            live = [legacy_pid] if legacy_pid else []
+        for pid in live:
+            candidates.setdefault(pid, []).append(app)
+    return {
+        pid: owners[0]
+        for pid, owners in candidates.items()
+        if len(owners) == 1
+    }
+
+
+def build_apps(cfg, listeners, groups=None):
     """token 校验通过或严格命中旧版身份的进程才算 running。
 
-    额外显式返回“配置重复”与“端口被其他进程占用”，不再把任意
-    监听者误当成应用本身。
+    多张卡片可共享配置端口；只有当前真实监听者不属于本卡片时才返回
+    “端口被其他进程占用”，不再把任意监听者误当成应用本身。
     """
     port_map = {}
     for pid, port in listeners:
         port_map.setdefault(port, []).append(pid)
     apps_cfg = cfg.get("apps") or []
-    managed, snap, _ = managed_process_index(apps_cfg)
+    managed, snap, _ = managed_process_index(apps_cfg, groups)
     listen_by_pid = {}
     for pid, port in listeners:
         listen_by_pid.setdefault(pid, []).append(port)
-    configured = {}
-    for app in apps_cfg:
-        if app.get("port"):
-            configured.setdefault(app["port"], []).append(app)
+    configured_ports = {
+        app["port"] for app in apps_cfg if app.get("port")}
 
     # 端口诊断需要展示占用者的真实身份，一次批量取详情，避免逐卡 ps。
     configured_listener_pids = {
-        pid for port in configured for pid in port_map.get(port, [])}
+        pid for port in configured_ports for pid in port_map.get(port, [])}
     listener_snap = (ps_snapshot(configured_listener_pids, with_uid=True)
                      if configured_listener_pids else {})
     listener_cwds = lsof_cwds(configured_listener_pids)
-    managed_owner = {}
-    for owner_app in apps_cfg:
-        for owner_pid in managed.get(owner_app.get("id"), []):
-            managed_owner[owner_pid] = owner_app
+    verified_owner = listener_app_owners(
+        apps_cfg, listeners, listener_snap, listener_cwds)
 
     apps = []
     for app in apps_cfg:
         managed_live = managed.get(app["id"], [])
         legacy_pid = None if managed_live else legacy_managed_pid(
             app, listeners, listener_snap, listener_cwds)
+        if (legacy_pid and
+                (verified_owner.get(legacy_pid) or {}).get("id") != app.get("id")):
+            legacy_pid = None
         live = managed_live or ([legacy_pid] if legacy_pid else [])
         lp = app.get("lastPid")
         pid = lp if lp in live else (live[0] if live else None)
@@ -955,13 +1197,15 @@ def build_apps(cfg, listeners):
         occupied = bool(port and configured_listeners and not listening)
         owner_pid = configured_listeners[0] if occupied else None
         owner_info = listener_snap.get(owner_pid, {}) if owner_pid else {}
-        owner_app = managed_owner.get(owner_pid)
+        owner_app = verified_owner.get(owner_pid)
         owner_cwd = listener_cwds.get(owner_pid) if owner_pid else None
         port_owner = None
         if owner_pid:
             comm = owner_info.get("comm") or ""
             port_owner = {
                 "pid": owner_pid,
+                "openHost": listener_open_host(
+                    listeners, port, {owner_pid}),
                 "name": os.path.basename(comm) or "?",
                 "cmd": owner_info.get("args") or comm,
                 "cwd": owner_cwd,
@@ -972,11 +1216,18 @@ def build_apps(cfg, listeners):
                 "appId": owner_app.get("id") if owner_app else None,
                 "appName": owner_app.get("name") if owner_app else None,
             }
-        conflicts = [other.get("name") or other.get("id")
-                     for other in configured.get(port, [])
-                     if other.get("id") != app.get("id")] if port else []
         actual_ports = sorted({p for member in live
                                for p in listen_by_pid.get(member, [])})
+        open_hosts = {
+            str(actual_port): listener_open_host(
+                listeners, actual_port, set(live))
+            for actual_port in actual_ports
+        }
+        try:
+            health = inspect_app_health(app)
+        except Exception as exc:
+            LOG.warning("检查应用配置失败（%s）：%s", app.get("id"), exc)
+            health = {"status": "unknown", "blocking": False, "issues": []}
         apps.append({
             "id": app["id"], "name": app["name"], "command": app["command"],
             "cwd": app.get("cwd"), "port": port,
@@ -986,14 +1237,19 @@ def build_apps(cfg, listeners):
             "uptimeSec": ((snap.get(pid) or listener_snap.get(pid) or {}).get("etime")
                           if pid else None),
             "kind": app.get("kind") or "service",
-            "lastExit": app.get("lastExit"),
+            "attached": bool(app.get("attached")),
+            "lastExit": public_last_exit(app),
+            "health": health,
             "ports": actual_ports,
+            "openHosts": open_hosts,
             "listening": listening,
             "portOccupied": occupied,
             "portOccupiedPid": configured_listeners[0] if occupied else None,
             "portOwner": port_owner,
-            "portConflict": bool(conflicts),
-            "portConflictApps": conflicts,
+            # 多张停止卡片可以共享常见开发端口；只有真正启动时的监听占用
+            # 才是冲突。字段保留给旧前端兼容，但不再表示配置重复。
+            "portConflict": False,
+            "portConflictApps": [],
             "legacyManaged": bool(legacy_pid),
         })
     return apps
@@ -1001,24 +1257,30 @@ def build_apps(cfg, listeners):
 
 def build_state(cfg, console_port, config_health=None):
     degraded_reasons = []
+    # 一次 pgid 快照供 build_services / build_apps 共享，避免每轮两次全量 ps。
+    needs_groups = any(
+        app.get("runToken")
+        and isinstance(app.get("lastPgid") or app.get("lastPid"), int)
+        for app in cfg.get("apps") or [])
+    groups = pgid_members_map() if needs_groups else None
     try:
-        services, listeners = build_services(cfg)
+        services, listeners = build_services(cfg, groups)
     except Exception as e:
         LOG.exception("构建服务监控状态失败")
         services, listeners = [], set()
-        degraded_reasons.append({"component": "services", "error": str(e)})
+        degraded_reasons.append({"component": "services"})
     try:
         watched = build_watched(cfg.get("watchedKeywords"))
     except Exception as e:
         LOG.exception("构建关注进程状态失败")
         watched = []
-        degraded_reasons.append({"component": "watched", "error": str(e)})
+        degraded_reasons.append({"component": "watched"})
     try:
-        apps = build_apps(cfg, listeners)
+        apps = build_apps(cfg, listeners, groups)
     except Exception as e:
         LOG.exception("构建启动台状态失败")
         apps = []
-        degraded_reasons.append({"component": "apps", "error": str(e)})
+        degraded_reasons.append({"component": "apps"})
     if VERSION_LOAD_ERROR:
         degraded_reasons.append(
             {"component": "version", "error": VERSION_LOAD_ERROR})
@@ -1036,9 +1298,36 @@ def build_state(cfg, console_port, config_health=None):
         "schemaVersion": cfg.get("schemaVersion", CURRENT_SCHEMA_VERSION),
         "degraded": bool(degraded_reasons),
         "degradedReasons": degraded_reasons,
-        "uiTheme": cfg.get("uiTheme") or "apollo",
+        "configHealth": dict(config_health or {}),
+        "uiTheme": cfg.get("uiTheme") or DEFAULT_UI_THEME,
         "themes": list_themes(),
     }
+
+
+# ---------------------------------------------------------------- 状态快照缓存
+# 每次快照要跑约十余个 ps/lsof 子进程。TTL 略大于前端 2s 轮询周期：
+# 单标签页约每 2-3 轮重建一次，多标签页请求自动合并（锁内构建排队后
+# 第二个请求直接命中缓存）。配置/进程变更时 invalidate 立即失效。
+STATE_CACHE_TTL = 2.2  # 秒
+_state_cache_lock = threading.Lock()
+_state_cache = {"mono": 0.0, "state": None}
+
+
+def invalidate_state_cache():
+    with _state_cache_lock:
+        _state_cache["state"] = None
+
+
+def get_state_snapshot(cfg, console_port):
+    now = time.monotonic()
+    with _state_cache_lock:
+        cached = _state_cache["state"]
+        if cached is not None and now - _state_cache["mono"] < STATE_CACHE_TTL:
+            return cached
+        state = build_state(cfg.snapshot(), console_port, cfg.health_info())
+        _state_cache["mono"] = time.monotonic()
+        _state_cache["state"] = state
+        return state
 
 
 def build_health(cfg):
@@ -1088,7 +1377,8 @@ def build_health(cfg):
 
 
 def list_themes():
-    """扫描 static/themes/*.json 主题清单（css 文件必须存在），供注册切换。"""
+    """扫描 static/themes/*.json 主题清单（css 文件必须存在），供注册切换。
+    默认主题固定排在首位，其余按文件名排序。"""
     themes = []
     try:
         names = sorted(os.listdir(THEMES_DIR))
@@ -1113,6 +1403,7 @@ def list_themes():
             })
         except Exception:
             LOG.exception("读取主题清单失败: %s", name)
+    themes.sort(key=lambda t: t["id"] != DEFAULT_UI_THEME)
     return themes
 
 
@@ -1278,12 +1569,15 @@ def watch_app_exit(cfg, app_id, proc, token, started_at=None):
             if (not manually_stopped and target
                     and target.get("lastPid") == proc.pid
                     and target.get("runToken") == token):
-                target["lastExit"] = {
+                last_exit = {
                     "code": code,
                     "at": int(ended_at),
                     "startedAt": int(started_at * 1000),
                     "durationSec": duration,
                 }
+                if (target.get("kind") or "service") == "task":
+                    last_exit["status"] = classify_task_exit(code)
+                target["lastExit"] = last_exit
         cfg.update(op)
         rotate_log_file(os.path.join(LOGS_DIR, "%s.log" % app_id))
     thread = threading.Thread(target=_wait, daemon=True)
@@ -1301,8 +1595,8 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
             target["lastPid"] = proc.pid
             target["lastPgid"] = pgid
             target["runToken"] = token
-            # 批处理任务运行时保留上一次完成结果；如果用户手动停止本次任务，
-            # 卡片仍可显示之前的历史，而不是退回“未运行”。自然退出会覆盖它。
+            target["attached"] = False
+            # 批处理任务运行时先保留上一次结果；自然退出或手动停止后再原子覆盖。
             if (target.get("kind") or "service") != "task":
                 target["lastExit"] = None
             return True
@@ -1313,8 +1607,8 @@ def persist_started_app(cfg, app_id, proc, pgid, token):
     return saved
 
 
-def clear_app_runtime(cfg, app_id, expected_token=None):
-    """清除应用的受控身份；可用 token 防止并发重启互相覆盖。"""
+def clear_app_runtime(cfg, app_id, expected_token=None, last_exit=None):
+    """清除受控身份；可用 token 防竞态，并可原子写入本次退出结果。"""
     def op(c):
         target = find_app(c, app_id)
         if not target:
@@ -1324,6 +1618,9 @@ def clear_app_runtime(cfg, app_id, expected_token=None):
         target["lastPid"] = None
         target["lastPgid"] = None
         target["runToken"] = None
+        target["attached"] = False
+        if last_exit is not None:
+            target["lastExit"] = last_exit
         return True
     return cfg.update(op)
 
@@ -1350,6 +1647,197 @@ def pick_path(what):
     if r.returncode != 0:  # 用户按了取消（"User canceled."）
         return None, True
     return r.stdout.strip().rstrip("/") or None, False
+
+
+def command_for_script(path):
+    """按脚本类型生成可直接保存的 shell 命令，并安全引用任意文件名。"""
+    normalized = os.path.abspath(os.path.expanduser(str(path)))
+    quoted = shlex.quote(normalized)
+    suffix = os.path.splitext(normalized)[1].lower()
+    if suffix == ".py":
+        return "python3 -- %s" % quoted
+    if suffix == ".zsh":
+        return "/bin/zsh -- %s" % quoted
+    if suffix in (".sh", ".bash"):
+        return "/bin/bash -- %s" % quoted
+    if os.access(normalized, os.X_OK):
+        return quoted
+    # .command 常见于 Finder 双击脚本；没有执行位时仍可明确交给 bash。
+    return "/bin/bash -- %s" % quoted
+
+
+SCRIPT_SUFFIXES = {".py", ".sh", ".bash", ".zsh", ".command"}
+SHELL_BUILTINS = {
+    ".", ":", "[", "alias", "break", "cd", "command", "continue", "echo",
+    "eval", "exec", "exit", "export", "false", "printf", "pwd", "read",
+    "return", "set", "shift", "source", "test", "true", "type", "ulimit",
+    "umask", "unalias", "unset", "wait",
+}
+
+
+def _simple_command_tokens(command):
+    """解析无管道/重定向/展开的简单命令；不确定时返回 None。"""
+    if not isinstance(command, str) or not command.strip():
+        return []
+    try:
+        lexer = shlex.shlex(
+            command, posix=True, punctuation_chars="|&;<>()")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if not tokens:
+        return []
+    if any(token and all(char in "|&;<>()" for char in token)
+           for token in tokens):
+        return None
+    # 健康检查绝不展开变量、通配符或命令替换；这类命令照常允许运行。
+    if any(any(char in token for char in ("$", "*", "?", "[", "]", "`"))
+           for token in tokens):
+        return None
+    return tokens
+
+
+def _resolve_command_path(value, cwd):
+    value = os.path.expanduser(value)
+    if os.path.isabs(value):
+        return os.path.normpath(value)
+    return os.path.normpath(os.path.join(cwd, value))
+
+
+def _script_target(tokens, cwd):
+    """提取 (路径, 是否直接执行, 原路径是否相对)，否则返回空。"""
+    if not tokens:
+        return None, False, False
+    index = 0
+    while index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return None, False, False
+    executable = tokens[index]
+    base = os.path.basename(executable)
+    args = tokens[index + 1:]
+
+    if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", base):
+        if "-m" in args or "-c" in args:
+            return None, False, False
+        if args and args[0] == "--":
+            args = args[1:]
+        candidate = next((arg for arg in args if not arg.startswith("-")), None)
+        if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
+                          or "/" in candidate):
+            return (_resolve_command_path(candidate, cwd), False,
+                    not os.path.isabs(os.path.expanduser(candidate)))
+        return None, False, False
+
+    if base in {"bash", "sh", "zsh"}:
+        if any(arg == "--command"
+               or (arg.startswith("-") and "c" in arg[1:])
+               for arg in args):
+            return None, False, False
+        if args and args[0] == "--":
+            args = args[1:]
+        candidate = next((arg for arg in args if not arg.startswith("-")), None)
+        if candidate and (os.path.splitext(candidate)[1].lower() in SCRIPT_SUFFIXES
+                          or "/" in candidate):
+            return (_resolve_command_path(candidate, cwd), False,
+                    not os.path.isabs(os.path.expanduser(candidate)))
+        return None, False, False
+
+    suffix = os.path.splitext(executable)[1].lower()
+    if suffix in SCRIPT_SUFFIXES or "/" in executable:
+        return (_resolve_command_path(executable, cwd), True,
+                not os.path.isabs(os.path.expanduser(executable)))
+    return None, False, False
+
+
+def inspect_app_health(app):
+    """静态检查配置是否可运行；只读文件系统，绝不执行或展开用户命令。"""
+    issues = []
+
+    def add(kind, title, detail, fix, action):
+        issues.append({
+            "kind": kind,
+            "severity": "error",
+            "title": title,
+            "detail": detail,
+            "fix": fix,
+            "action": action,
+        })
+
+    configured_cwd = app.get("cwd")
+    cwd = configured_cwd or os.path.expanduser("~")
+    cwd_ok = os.path.isdir(cwd)
+    if configured_cwd and not cwd_ok:
+        add(
+            "cwd-missing", "工作目录不可用",
+            "找不到配置的工作目录：%s" % configured_cwd,
+            "编辑这个项目，重新选择工作区文件夹。",
+            "pick-cwd",
+        )
+
+    tokens = _simple_command_tokens(app.get("command") or "")
+    if tokens is None:
+        return {
+            "status": "error" if issues else "unknown",
+            "blocking": bool(issues),
+            "issues": issues,
+        }
+
+    script_path, direct, script_was_relative = _script_target(tokens, cwd)
+    if script_path and (cwd_ok or not script_was_relative):
+        if not os.path.isfile(script_path):
+            add(
+                "script-missing", "脚本不可用",
+                "找不到脚本：%s" % script_path,
+                "编辑这个任务，重新选择脚本或修改执行命令。",
+                "pick-script",
+            )
+        elif not os.access(script_path, os.R_OK):
+            add(
+                "path-unreadable", "脚本不可读取",
+                "当前用户没有读取权限：%s" % script_path,
+                "检查脚本权限，或重新选择一个可读取的脚本。",
+                "pick-script",
+            )
+        elif direct and not os.access(script_path, os.X_OK):
+            add(
+                "script-not-executable", "脚本不可执行",
+                "直接运行的脚本没有执行权限：%s" % script_path,
+                "给脚本执行权限，或改为使用 bash / python3 执行。",
+                "edit-command",
+            )
+
+    # 直接脚本已由上面的文件检查覆盖；其他简单命令检查首个运行时。
+    index = 0
+    while tokens and index < len(tokens) and re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[index]):
+        index += 1
+    executable = tokens[index] if tokens and index < len(tokens) else ""
+    executable_base = os.path.basename(executable)
+    if executable and not direct and executable_base not in SHELL_BUILTINS:
+        if "/" in executable:
+            runtime = _resolve_command_path(executable, cwd)
+            runtime_ok = os.path.isfile(runtime) and os.access(runtime, os.X_OK)
+        else:
+            runtime = executable
+            runtime_ok = bool(shutil.which(
+                executable, path=build_launch_env("health-check").get("PATH")))
+        if not runtime_ok:
+            add(
+                "runtime-missing", "找不到 %s" % executable_base,
+                "总控台的运行环境里找不到命令：%s" % executable,
+                "安装对应运行时，或在编辑中修改执行命令。",
+                "edit-command",
+            )
+
+    return {
+        "status": "error" if issues else "ok",
+        "blocking": bool(issues),
+        "issues": issues,
+    }
 
 
 # ---------------------------------------------------------------- 项目启动识别
@@ -1645,6 +2133,30 @@ def resolve_app_stop_target(app, listeners=None):
         return None, "受控进程组信息无效"
     legacy_pid = legacy_managed_pid(app, listeners)
     if legacy_pid:
+        if app.get("attached"):
+            try:
+                pgid = os.getpgid(legacy_pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+            if isinstance(pgid, int) and pgid > 0 and pgid != os.getpgrp():
+                members = _current_user_group_members(pgid)
+                member_cwds = lsof_cwds(members)
+                expected_cwd = app.get("cwd")
+                try:
+                    safe_group = bool(members and expected_cwd) and all(
+                        member_cwds.get(pid)
+                        and os.path.realpath(member_cwds[pid])
+                        == os.path.realpath(expected_cwd)
+                        for pid in members
+                    )
+                except OSError:
+                    safe_group = False
+                if safe_group:
+                    return {
+                        "kind": "group",
+                        "id": pgid,
+                        "members": list(members),
+                    }, None
         return {"kind": "pid", "id": legacy_pid, "members": [legacy_pid]}, None
     return None, "无法确认受控进程，未执行停止"
 
@@ -1665,7 +2177,7 @@ def signal_app_stop(target, sig=signal.SIGTERM):
         return False, "停止受控进程失败: %s" % e
 
 
-def stop_target_alive(target):
+def stop_target_alive(target, expected_uid=None):
     if target["kind"] == "group":
         try:
             os.killpg(target["id"], 0)
@@ -1678,7 +2190,9 @@ def stop_target_alive(target):
             return True
     try:
         os.kill(target["id"], 0)
-        return process_uid(target["id"]) == SELF_UID
+        if expected_uid is None:
+            expected_uid = process_uid(target["id"])
+        return expected_uid == SELF_UID
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -1701,7 +2215,11 @@ def stop_app_and_wait(app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
     if not ok:
         return False, error
     deadline = time.monotonic() + max(0.0, timeout)
-    while stop_target_alive(target):
+    # uid 只查一次：信号已在循环外发出，循环仅做存活探测，
+    # 避免 50ms 一次的 ps 子进程（PID 复用时最坏多等一个超时周期，无副作用）。
+    expected_uid = (process_uid(target["id"]) if target["kind"] == "pid"
+                    else None)
+    while stop_target_alive(target, expected_uid):
         if time.monotonic() >= deadline:
             remaining = (target["members"] if target["kind"] == "pid"
                          else _current_user_group_members(target["id"]))
@@ -1720,7 +2238,16 @@ def stop_app_and_clear(cfg, app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
         ok, error = stop_app_and_wait(app, timeout, listeners)
         if not ok:
             return False, error
-        if not clear_app_runtime(cfg, app["id"], app.get("runToken")):
+        last_exit = None
+        if (app.get("kind") or "service") == "task":
+            # 覆盖可能保留的旧成功记录，避免“刚刚手动停止”仍显示上次成功。
+            last_exit = {
+                "status": "stopped",
+                "code": None,
+                "at": int(time.time()),
+            }
+        if not clear_app_runtime(
+                cfg, app["id"], app.get("runToken"), last_exit=last_exit):
             return False, "进程已停止，但应用状态已变化，请刷新后重试"
         return True, None
     finally:
@@ -1728,13 +2255,84 @@ def stop_app_and_clear(cfg, app, timeout=APP_STOP_TIMEOUT_SEC, listeners=None):
             MANUAL_STOP_TOKENS.discard(marker)
 
 
-def stop_app(app, listeners=None):
-    """兼容旧调用：只发送停止信号并准确报告失败，不清除配置状态。"""
-    target, _ = resolve_app_stop_target(app, listeners)
-    if target is None:
-        return False
-    ok, _ = signal_app_stop(target)
-    return ok
+def inspect_attach_process(cfg, app, pid):
+    """只读校验待认领进程，返回其可信工作目录。
+
+    创建卡片时先调用本函数，再把卡片与运行身份一次写入配置，避免前端
+    “先创建、再认领”只完成一半。已有卡片的手动认领也复用同一套校验。"""
+    if (app.get("kind") or "service") != "service":
+        return False, "批处理任务没有端口，无法认领进程", {"status": 422}
+    port = app.get("port")
+    if not isinstance(port, int) or port <= 0:
+        return False, "卡片未配置端口，无法认领进程", {"status": 422}
+    if app_alive_sign(app):
+        return False, "应用已在运行", {"status": 409}
+    if pid == os.getpid():
+        return False, "不能认领总控台自身", {"status": 409}
+    listeners = scan_listeners()
+    if (pid, port) not in listeners:
+        return False, "PID %d 并未监听端口 %d，进程可能已退出" % (pid, port), {"status": 409}
+    snap = ps_snapshot({pid}, with_uid=True)
+    if snap.get(pid, {}).get("uid") != SELF_UID:
+        return False, "该进程不属于当前用户，不能认领", {"status": 403}
+    cfg_now = cfg.snapshot()
+    owners = listener_app_owners(cfg_now.get("apps") or [], listeners, snap, None)
+    if pid in owners:
+        return False, "该进程已由卡片「%s」管理" % owners[pid].get("name", ""), {"status": 409}
+    actual_cwd = lsof_cwds({pid}).get(pid)
+    if not actual_cwd:
+        return False, "无法读取进程工作目录，已取消认领", {"status": 409}
+    return True, None, {"status": 200, "cwd": actual_cwd}
+
+
+def attach_app_process(cfg, app_id, app, pid):
+    """把已在监听配置端口的当前用户进程认领为本卡片受管进程。
+
+    认领走旧版身份通道（lastPid + 监听端口 + 当前 UID + 真实 cwd 四重校验），
+    与卡片 cwd 不一致时原子同步卡片 cwd。认领后卡片显示运行中，可正常
+    停止/重启（重启后转为 token 受管）。返回 (ok, error, info)。"""
+    ok, error, identity = inspect_attach_process(cfg, app, pid)
+    if not ok:
+        return False, error, identity
+    actual_cwd = identity["cwd"]
+    cwd_updated = False
+    pid_conflict = False
+
+    def op(c):
+        nonlocal cwd_updated, pid_conflict
+        target = find_app(c, app_id)
+        if not target:
+            return False
+        # 认领检查与写入必须同锁：inspect 用的是旧快照，并发请求可能同时
+        # 通过校验。在写锁内重验 pid 是否已被其他卡片认领。
+        if any(other.get("lastPid") == pid
+               for other in c.get("apps") or [] if other.get("id") != app_id):
+            pid_conflict = True
+            return False
+        target["lastPid"] = pid
+        target["lastPgid"] = None
+        target["runToken"] = None
+        target["attached"] = True
+        target["lastExit"] = None
+        try:
+            same = (isinstance(target.get("cwd"), str) and target["cwd"]
+                    and os.path.realpath(target["cwd"]) == os.path.realpath(actual_cwd))
+        except OSError:
+            same = False
+        if not same:
+            target["cwd"] = actual_cwd
+            cwd_updated = True
+        return True
+
+    if not cfg.update(op):
+        if pid_conflict:
+            return False, "该进程已由其他卡片管理", {"status": 409}
+        return False, "应用已被删除", {"status": 404}
+    info = {}
+    if cwd_updated:
+        info["cwdUpdated"] = True
+        info["cwd"] = actual_cwd
+    return True, None, info
 
 
 # ---------------------------------------------------------------- 日志
@@ -1776,6 +2374,8 @@ def _tail_file_lines(path, count, block_size=65536):
                 pos -= size
                 f.seek(pos)
                 chunk = f.read(size)
+                if not chunk.strip(b"\x00"):
+                    break  # 空洞/被外部截断后残留的 NUL 段：之前没有内容，停止回扫
                 chunks.append(chunk)
                 newlines += chunk.count(b"\n")
         data = b"".join(reversed(chunks))
@@ -1882,10 +2482,12 @@ def sniff_icon_bytes(data, ctype=""):
     return None
 
 
-def fetch_favicon(port):
-    """抓 http://127.0.0.1:{port} 的站点图标 → (bytes, ext) | (None, None)。
+def fetch_favicon(port, host="127.0.0.1"):
+    """抓本地站点图标 → (bytes, ext) | (None, None)。
     先解析首页 <link rel=...icon...>（含 apple-touch-icon），兜底 /favicon.ico。"""
-    base = "http://127.0.0.1:%d" % port
+    if host not in ("127.0.0.1", "localhost"):
+        host = "127.0.0.1"
+    base = "http://%s:%d" % (host, port)
     candidates = []
     html, _ = http_get(base + "/", port)
     if html:
@@ -1913,25 +2515,21 @@ def find_app(cfg, app_id):
     return None
 
 
-def find_port_conflicts(cfg, port, exclude_id=None):
-    if not port:
-        return []
-    return [app for app in cfg.get("apps") or []
-            if app.get("port") == port and app.get("id") != exclude_id]
-
-
 def diagnose_app(cfg, app):
     """规则诊断：退出码 + 日志模式 + 文件系统检查 → 可执行的修复建议列表。
 
     覆盖常见失败：依赖未装、命令/脚本不存在、运行时缺失、npm 脚本名错误、
-    端口占用、权限不足、Python 包缺失、配置端口重复。
+    端口占用、权限不足、Python 包缺失。
     """
     issues = []
 
-    def add(kind, title, detail, fix):
+    def add(kind, title, detail, fix, action=None):
         if not any(i["kind"] == kind for i in issues):
-            issues.append({"kind": kind, "title": title,
-                           "detail": detail, "fix": fix})
+            issue = {"kind": kind, "title": title,
+                     "detail": detail, "fix": fix}
+            if action:
+                issue["action"] = action
+            issues.append(issue)
 
     app_id = app.get("id") or ""
     cwd = app.get("cwd") or ""
@@ -1942,10 +2540,14 @@ def diagnose_app(cfg, app):
     log_lower = log_tail.lower()
 
     # ---- 配置层检查（不依赖日志） ----
-    if cwd and not os.path.isdir(cwd):
-        add("cwd-missing", "工作目录不存在",
-            "配置的目录不存在：%s" % cwd,
-            "确认目录是否被移动/删除、外接磁盘是否已挂载，然后在编辑里重新选择工作区。")
+    for health_issue in inspect_app_health(app).get("issues", []):
+        add(
+            health_issue["kind"],
+            health_issue["title"],
+            health_issue["detail"],
+            health_issue["fix"],
+            health_issue.get("action"),
+        )
 
     pkg_json = os.path.join(cwd, "package.json") if cwd else ""
     has_pkg = bool(cwd) and os.path.isfile(pkg_json)
@@ -1957,13 +2559,6 @@ def diagnose_app(cfg, app):
         add("deps-missing", "依赖未安装（node_modules 缺失）",
             "目录里有 package.json，但没有 node_modules。",
             "终端执行：cd \"%s\" && %s install，装完再启动。" % (cwd, mgr))
-
-    # 配置端口与其他应用重复
-    conflicts = find_port_conflicts(cfg, port, exclude_id=app_id)
-    if port and conflicts:
-        add("port-dup", "端口与其他应用重复",
-            ":%s 还被「%s」配置。" % (port, "、".join(a.get("name") or a.get("id") for a in conflicts)),
-            "给其中一个应用改成不同的端口。")
 
     # ---- 日志模式匹配 ----
     m = re.search(r"cannot find module '([^']+)'", log_lower)
@@ -2022,7 +2617,8 @@ def diagnose_app(cfg, app):
             add("not-found", "命令不存在（exit 127）",
                 "退出码 127 表示 shell 找不到这个命令。",
                 "确认命令已安装且在 PATH 里；总控台会补常见路径，但程序本身要存在。")
-        elif isinstance(code, int) and code == 0:
+        elif (isinstance(code, int) and code == 0
+              and (app.get("kind") or "service") != "task"):
             add("quick-exit", "命令立即正常退出（exit 0）",
                 "进程启动后马上正常结束——长期服务命令不应立刻退出。",
                 "确认写的是常驻命令（如 hexo s / npm run dev），而不是一次就完成的命令。")
@@ -2143,10 +2739,23 @@ class ConsoleServer(ThreadingHTTPServer):
         self._console_action = None
         self._console_helper_pid = None
 
+    def handle_error(self, request, client_address):
+        """空闲连接超时 / 客户端中途断开属正常现象，不刷 traceback。"""
+        exc_type, exc, _ = sys.exc_info()
+        if exc_type and isinstance(exc, (TimeoutError, BrokenPipeError,
+                                         ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
     def try_app_operation(self, app_id):
         with self._app_locks_guard:
             lock = self._app_locks.setdefault(app_id, threading.Lock())
         return lock if lock.acquire(blocking=False) else None
+
+    def forget_app_lock(self, app_id):
+        """应用删除后回收其操作锁（调用方应已持有该锁）。"""
+        with self._app_locks_guard:
+            self._app_locks.pop(app_id, None)
 
     def reserve_console_action(self, action):
         with self._console_action_guard:
@@ -2169,6 +2778,16 @@ class ConsoleServer(ThreadingHTTPServer):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "Console/%s" % APP_VERSION
+    # 每连接 socket 超时：慢速/谎报 Content-Length 的客户端无法无限占住
+    # 线程（默认 None 会永久阻塞 rfile.read）；空闲 keep-alive 连接也会回收。
+    SOCKET_TIMEOUT_SEC = 30.0
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.settimeout(self.SOCKET_TIMEOUT_SEC)
+        except OSError:
+            pass
 
     # ---------- 基础工具 ----------
 
@@ -2234,6 +2853,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_err(status, message)
         return False
 
+    def _handle_request_error(self, method, exc):
+        """请求处理异常统一入口：细节只进日志，响应不回内部信息。"""
+        LOG.exception("%s %s 处理失败", method, self.path)
+        try:
+            self.send_err(500, "服务器错误")
+        except Exception:
+            pass
+
     def authorize_request(self, mutating=False, content_kind=None):
         """Enforce the loopback browser trust boundary.
 
@@ -2281,7 +2908,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._deny_request(413, "请求体过大")
         return True
 
-    def _send(self, body, status=200, ctype="text/plain; charset=utf-8"):
+    def _send(self, body, status=200, ctype="text/plain; charset=utf-8",
+              set_cookie=True):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
@@ -2296,7 +2924,7 @@ class Handler(BaseHTTPRequestHandler):
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; connect-src 'self'; img-src 'self' data: blob:; "
             "font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'")
-        if self._request_host_allowed():
+        if set_cookie and self._request_host_allowed():
             self.send_header(
                 "Set-Cookie",
                 "console_session=%s; Path=/; HttpOnly; SameSite=Strict" %
@@ -2365,16 +2993,17 @@ class Handler(BaseHTTPRequestHandler):
             parsed = urllib.parse.urlparse(self.path)
             path = parsed.path
             if path == "/favicon.ico":
-                self._send(b"", 204)
+                self.serve_static("/assets/favicon.ico")
                 return
             if path == "/api/health":
                 self.send_json(build_health(self.server.cfg))
                 return
             if path == "/api/state":
-                state = build_state(self.server.cfg.snapshot(),
-                                    self.server.console_port,
-                                    self.server.cfg.health_info())
-                self.send_json(state)
+                self.send_json(get_state_snapshot(self.server.cfg,
+                                                  self.server.console_port))
+                return
+            if path == "/api/console/log":
+                self.handle_console_log(parsed.query)
                 return
             m = APP_ROUTE_RE.match(path)
             if m and m.group(2) == "logs":
@@ -2390,25 +3019,24 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            LOG.exception("GET %s 处理失败", self.path)
-            try:
-                self.send_err(500, "服务器错误: %s" % e)
-            except Exception:
-                pass
+            self._handle_request_error("GET", e)
 
     def serve_static(self, path):
         rel = urllib.parse.unquote(path).lstrip("/") or "index.html"
         full = os.path.normpath(os.path.join(STATIC_DIR, rel))
+        # realpath 解析后必须仍在 STATIC_DIR 内，防路径穿越与符号链接逃逸。
         try:
-            inside = os.path.commonpath([STATIC_DIR, full]) == STATIC_DIR
-        except ValueError:
+            inside = os.path.commonpath(
+                [os.path.realpath(STATIC_DIR), os.path.realpath(full)]
+            ) == os.path.realpath(STATIC_DIR)
+        except (ValueError, OSError):
             inside = False
         if not inside or not os.path.isfile(full):
             if rel == "index.html":
                 self._send(PLACEHOLDER_HTML.encode("utf-8"), 200,
                            "text/html; charset=utf-8")
             else:
-                self._send(b"404 Not Found", 404)
+                self._send(b"404 Not Found", 404, set_cookie=False)
             return
         ctype = STATIC_TYPES.get(os.path.splitext(full)[1].lower(),
                                  "application/octet-stream")
@@ -2416,9 +3044,9 @@ class Handler(BaseHTTPRequestHandler):
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
-            self._send(b"404 Not Found", 404)
+            self._send(b"404 Not Found", 404, set_cookie=False)
             return
-        self._send(data, 200, ctype)
+        self._send(data, 200, ctype, set_cookie=False)
 
     def serve_icon(self, path):
         name = os.path.basename(urllib.parse.unquote(path[len("/icons/"):]))
@@ -2428,27 +3056,36 @@ class Handler(BaseHTTPRequestHandler):
             return
         full = os.path.join(ICONS_DIR, name)
         if not os.path.isfile(full):
-            self._send(b"404 Not Found", 404)
+            self._send(b"404 Not Found", 404, set_cookie=False)
             return
         ctype = STATIC_TYPES.get(ext, "application/octet-stream")
         try:
             with open(full, "rb") as f:
                 data = f.read()
         except OSError:
-            self._send(b"404 Not Found", 404)
+            self._send(b"404 Not Found", 404, set_cookie=False)
             return
-        self._send(data, 200, ctype)
+        self._send(data, 200, ctype, set_cookie=False)
 
     def handle_logs(self, app_id, query):
         _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        try:
-            tail = int(urllib.parse.parse_qs(query).get("tail", ["300"])[0])
-        except (ValueError, IndexError):
-            tail = 300
-        tail = max(1, min(tail, 5000))
+        tail = self._parse_log_tail(query)
         self.send_json({"text": read_log_tail(app_id, tail)})
+
+    def handle_console_log(self, query):
+        """总控台自身日志（data/logs/console.log），与维护线程共用轮转。"""
+        tail = self._parse_log_tail(query)
+        self.send_json({"text": read_log_tail("console", tail)})
+
+    @staticmethod
+    def _parse_log_tail(query, default=300):
+        try:
+            tail = int(urllib.parse.parse_qs(query).get("tail", [default])[0])
+        except (ValueError, IndexError):
+            tail = default
+        return max(1, min(tail, 5000))
 
     # ---------- POST ----------
 
@@ -2512,6 +3149,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.discard_body()
                     self.handle_app_diagnose(app_id)
                     return
+                if action == "attach":
+                    self.handle_app_attach(app_id)
+                    return
                 if action == "icon":
                     self.handle_icon_upload(app_id)
                     return
@@ -2523,11 +3163,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            LOG.exception("POST %s 处理失败", self.path)
-            try:
-                self.send_err(500, "服务器错误: %s" % e)
-            except Exception:
-                pass
+            self._handle_request_error("POST", e)
 
     def handle_pick(self):
         data, err = self.read_json_body()
@@ -2544,7 +3180,10 @@ class Handler(BaseHTTPRequestHandler):
         elif not path:
             self.send_json({"ok": False, "error": "无法打开系统选择框"})
         else:
-            self.send_json({"ok": True, "path": path})
+            result = {"ok": True, "path": path}
+            if what == "script":
+                result["command"] = command_for_script(path)
+            self.send_json(result)
 
     def handle_project_detect(self):
         data, err = self.read_json_body()
@@ -2597,6 +3236,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(500, "无法启动重启程序: %s" % e)
             return
         self.server.set_console_helper_pid(helper_pid)
+        invalidate_state_cache()
         self.send_json({"ok": True, "pid": SELF_PID,
                         "helperPid": helper_pid,
                         "port": self.server.console_port})
@@ -2612,6 +3252,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_err(409, "总控台正在重启，无法同时停止")
             return
         schedule_console_stop(self.server)
+        invalidate_state_cache()
         self.send_json({"ok": True, "pid": SELF_PID,
                         "port": self.server.console_port})
 
@@ -2625,6 +3266,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_err(400, "缺少字段 pid（正整数）")
             return
         ok, err = kill_process(pid, bool(data.get("force")))
+        if ok:
+            invalidate_state_cache()
         self.send_json({"ok": True} if ok else {"ok": False, "error": err})
 
     def handle_flag(self):
@@ -2683,34 +3326,82 @@ class Handler(BaseHTTPRequestHandler):
         if err:
             self.send_err(400, err)
             return
+        attach_pid = data.get("attachPid")
+        if attach_pid is not None and (
+                not isinstance(attach_pid, int)
+                or isinstance(attach_pid, bool)
+                or attach_pid <= 0):
+            self.send_err(400, "attachPid 必须是正整数")
+            return
         fields, err = validate_app_fields(data, partial=False)
         if err:
             self.send_err(400, err)
             return
 
-        def op(c):
-            conflicts = find_port_conflicts(c, fields.get("port"))
-            if conflicts:
-                return None, [a.get("name") or a.get("id") for a in conflicts]
+        snapshot = self.server.cfg.snapshot()
+        new_id = secrets.token_hex(4)
+        while find_app(snapshot, new_id):
             new_id = secrets.token_hex(4)
-            while find_app(c, new_id):
-                new_id = secrets.token_hex(4)
-            app = {"id": new_id, "name": fields["name"],
-                   "command": fields["command"], "cwd": fields["cwd"],
-                   "port": fields["port"], "emoji": fields["emoji"],
-                   "glyph": fields["glyph"], "kind": fields["kind"],
-                   "icon": None, "favicon": None, "lastPid": None,
-                   "lastPgid": None, "runToken": None,
-                   "lastExit": None, "createdAt": int(time.time())}
-            c["apps"].append(app)
-            return dict(app), []
+        app = {"id": new_id, "name": fields["name"],
+               "command": fields["command"], "cwd": fields["cwd"],
+               "port": fields["port"], "emoji": fields["emoji"],
+               "glyph": fields["glyph"], "kind": fields["kind"],
+               "icon": None, "favicon": None, "lastPid": None,
+               "lastPgid": None, "runToken": None,
+               "attached": False, "lastExit": None,
+               "createdAt": int(time.time())}
+        cwd_updated = False
+        if attach_pid is not None:
+            ok, error, identity = inspect_attach_process(
+                self.server.cfg, app, attach_pid)
+            if not ok:
+                self.send_json(
+                    {"ok": False, "error": error},
+                    identity.get("status", 409),
+                )
+                return
+            actual_cwd = identity["cwd"]
+            try:
+                cwd_updated = (
+                    not app.get("cwd")
+                    or os.path.realpath(app["cwd"]) != os.path.realpath(actual_cwd)
+                )
+            except OSError:
+                cwd_updated = True
+            app["cwd"] = actual_cwd
+            app["lastPid"] = attach_pid
+            app["attached"] = True
 
-        app, conflicts = self.server.cfg.update(op)
-        if conflicts:
-            self.send_err(409, "端口 %d 已被应用“%s”配置" %
-                          (fields["port"], "、".join(conflicts)))
+        attach_conflict = [False]
+
+        def op(c):
+            if find_app(c, new_id):
+                return None
+            # 与 attach_app_process 同规则：写锁内重验 pid 未被其他卡片认领。
+            if attach_pid is not None and any(
+                    other.get("lastPid") == attach_pid
+                    for other in c.get("apps") or []):
+                attach_conflict[0] = True
+                return None
+            c["apps"].append(app)
+            return dict(app)
+
+        created = self.server.cfg.update(op)
+        if created is None:
+            if attach_conflict[0]:
+                self.send_json(
+                    {"ok": False, "error": "该进程已由其他卡片管理"}, 409)
+            else:
+                self.send_err(409, "应用标识发生冲突，请重试")
             return
-        self.send_json(app)
+        if attach_pid is not None:
+            created.update({
+                "attached": True,
+                "running": True,
+                "pid": attach_pid,
+                "cwdUpdated": cwd_updated,
+            })
+        self.send_json(created)
 
     @serialized_app_operation
     def handle_fetch_favicon(self, app_id):
@@ -2732,7 +3423,8 @@ class Handler(BaseHTTPRequestHandler):
         if not port:
             self.send_json({"ok": False, "error": "应用未运行或无可用端口"})
             return
-        data, ext = fetch_favicon(port)
+        host = listener_open_host(listeners, port, live)
+        data, ext = fetch_favicon(port, host)
         if not data:
             self.send_json({"ok": False, "error": "未找到站点图标"})
             return
@@ -2774,17 +3466,20 @@ class Handler(BaseHTTPRequestHandler):
 
     @serialized_app_operation
     def handle_app_start(self, app_id):
-        cfg, app = self._get_app_or_404(app_id)
+        _, app = self._get_app_or_404(app_id)
         if app is None:
-            return
-        conflicts = find_port_conflicts(cfg, app.get("port"), app_id)
-        if conflicts:
-            names = "、".join(a.get("name") or a.get("id") for a in conflicts)
-            self.send_json({"ok": False, "error": "端口 %d 配置重复（%s），请先编辑其中一项" %
-                            (app["port"], names)}, 409)
             return
         if app_alive_sign(app):
             self.send_json({"ok": False, "error": "应用已在运行"})
+            return
+        health = inspect_app_health(app)
+        if health["blocking"]:
+            issue = health["issues"][0]
+            self.send_json({
+                "ok": False,
+                "error": "%s：%s" % (issue["title"], issue["detail"]),
+                "health": health,
+            }, 422)
             return
         port = app.get("port")
         occupied = [(pid, p) for pid, p in scan_listeners() if p == port] if port else []
@@ -2831,18 +3526,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json({"ok": True})
 
     @serialized_app_operation
-    def handle_app_restart(self, app_id):
-        cfg, app = self._get_app_or_404(app_id)
+    def handle_app_attach(self, app_id):
+        _, app = self._get_app_or_404(app_id)
         if app is None:
             return
-        conflicts = find_port_conflicts(cfg, app.get("port"), app_id)
-        if conflicts:
-            names = "、".join(a.get("name") or a.get("id") for a in conflicts)
-            self.send_err(409, "端口 %d 配置重复（%s），请先修复冲突" %
-                          (app["port"], names))
+        data, err = self.read_json_body()
+        if err:
+            self.send_err(400, err)
+            return
+        pid = data.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            self.send_err(400, "pid 必须是正整数")
+            return
+        ok, error, info = attach_app_process(self.server.cfg, app_id, app, pid)
+        if not ok:
+            self.send_json({"ok": False, "error": error}, info.get("status", 409))
+            return
+        resp = {"ok": True, "pid": pid}
+        resp.update(info)
+        self.send_json(resp)
+
+    @serialized_app_operation
+    def handle_app_restart(self, app_id):
+        _, app = self._get_app_or_404(app_id)
+        if app is None:
             return
         if not app_alive_sign(app):
             self.send_err(409, "应用未在运行")
+            return
+        # 必须在停止旧服务前预检；配置已失效时保留仍在工作的旧进程。
+        health = inspect_app_health(app)
+        if health["blocking"]:
+            issue = health["issues"][0]
+            self.send_json({
+                "ok": False,
+                "error": "%s：%s。旧服务仍在运行" %
+                         (issue["title"], issue["detail"]),
+                "health": health,
+            }, 422)
             return
 
         stopped, error = stop_app_and_clear(self.server.cfg, app)
@@ -2942,7 +3663,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(stop_before_update, bool):
                 self.send_err(400, "stopBeforeUpdate 必须是布尔值")
                 return
-            cfg, app = self._get_app_or_404(m.group(1))
+            _, app = self._get_app_or_404(m.group(1))
             if app is None:
                 return
             fields, err = validate_app_fields(data, partial=True)
@@ -2956,21 +3677,16 @@ class Handler(BaseHTTPRequestHandler):
             lifecycle_changed = any(
                 key in fields and fields[key] != app.get(key)
                 for key in lifecycle_fields)
-            if "port" in fields:
-                preflight_conflicts = find_port_conflicts(
-                    cfg, fields["port"], m.group(1))
-                if preflight_conflicts:
-                    names = "、".join(
-                        a.get("name") or a.get("id") for a in preflight_conflicts)
-                    self.send_err(409, "端口 %d 已被应用“%s”配置" %
-                                  (fields["port"], names))
-                    return
             stopped_for_update = False
             if lifecycle_changed and app_alive_sign(app):
                 if not stop_before_update:
+                    stop_label = ("中止任务"
+                                  if (app.get("kind") or "service") == "task"
+                                  else "停止服务")
                     self.send_json({
                         "ok": False,
-                        "error": "应用正在运行，请先在当前编辑面板停止服务；填写内容会保留",
+                        "error": "应用正在运行，请先在当前编辑面板%s；填写内容会保留" %
+                                 stop_label,
                         "requiresStop": True,
                     }, 409)
                     return
@@ -2982,19 +3698,10 @@ class Handler(BaseHTTPRequestHandler):
 
             def op(c):
                 target = find_app(c, m.group(1))
-                if "port" in fields:
-                    conflicts = find_port_conflicts(c, fields["port"], m.group(1))
-                    if conflicts:
-                        return None, [a.get("name") or a.get("id") for a in conflicts]
                 target.update(fields)
-                return dict(target), []
+                return dict(target)
 
-            updated, conflicts = self.server.cfg.update(op)
-            if conflicts:
-                prefix = "应用已停止；" if stopped_for_update else ""
-                self.send_err(409, prefix + "端口 %d 已被应用“%s”配置" %
-                              (fields["port"], "、".join(conflicts)))
-                return
+            updated = self.server.cfg.update(op)
             if stopped_for_update:
                 updated = dict(updated)
                 updated["stoppedForUpdate"] = True
@@ -3002,11 +3709,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            LOG.exception("PUT %s 处理失败", self.path)
-            try:
-                self.send_err(500, "服务器错误: %s" % e)
-            except Exception:
-                pass
+            self._handle_request_error("PUT", e)
         finally:
             if operation_lock is not None:
                 operation_lock.release()
@@ -3033,11 +3736,7 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            LOG.exception("DELETE %s 处理失败", self.path)
-            try:
-                self.send_err(500, "服务器错误: %s" % e)
-            except Exception:
-                pass
+            self._handle_request_error("DELETE", e)
 
     def do_OPTIONS(self):
         # No CORS endpoint exists. An explicit denial is clearer than the
@@ -3064,6 +3763,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.server.cfg.update(op):
             self.send_err(404, "应用不存在")
             return
+        self.server.forget_app_lock(app_id)
 
         for ext in ICON_EXTS:
             for fname in (app_id + ext, "fav-" + app_id + ext):
