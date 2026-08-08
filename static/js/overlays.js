@@ -4,7 +4,7 @@
    ============================================================ */
 import { $, el, setText, setChildren, icon, escapeHtml,
   post, put, del, act, toast, openLayer, closeLayer,
-  GLYPHS, findApp } from './core.js';
+  GLYPHS, findApp, bumpMutationEpoch } from './core.js';
 
 /* ---------------- DOM 引用 ---------------- */
 const appModalMask = $('#appModalMask'), appModal = $('#appModal'), appModalTitle = $('#appModalTitle');
@@ -82,8 +82,8 @@ export function confirmKill(svc) {
   openConfirm({
     title: '结束进程',
     bodyHtml: '确定要结束进程 <b>' + escapeHtml(svc.name || '') + '</b> 吗？' +
-      '<div class="confirm-detail mono">PID ' + svc.pid +
-      (svc.port ? ' · 端口 :' + svc.port : '') + '</div>',
+      '<div class="confirm-detail mono">PID ' + escapeHtml(String(svc.pid)) +
+      (svc.port ? ' · 端口 :' + escapeHtml(String(svc.port)) : '') + '</div>',
     okText: '结束',
     showForce: true,
     onOk: async force => {
@@ -524,6 +524,7 @@ async function saveApp() {
           return;
         }
         bumpIconVer(id);
+        bumpMutationEpoch();   // 原生 fetch 不经过 req，手动作废在途旧快照
       } catch (e) {
         toast('图标上传失败：' + e.message + '。配置已保存，可直接重试');
         await window.__poll();

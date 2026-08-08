@@ -129,6 +129,9 @@ const REQUEST_TIMEOUT_MS = 12000;
    是操作生效前发出的旧快照，前端会丢弃并立即补一轮，避免旧状态回退。 */
 let mutationEpoch = 0;
 export function currentMutationEpoch() { return mutationEpoch; }
+/* 原生 fetch（如图标原始字节上传）不经过 req，成功后需手动 bump，
+   使在途轮询的旧快照作废，避免图标延迟一帧才出现。 */
+export function bumpMutationEpoch() { mutationEpoch += 1; }
 
 async function req(method, path, body) {
   const controller = new AbortController();
@@ -502,7 +505,9 @@ export function applyUiTheme(name, persist = false) {
       if (previousStored == null) localStorage.removeItem('console-ui-theme');
       else localStorage.setItem('console-ui-theme', previousStored);
       if (state.data) state.data.uiTheme = previousState || previous;
-      toast('切换主题失败：' + e.message);
+      /* 非持久化调用（每轮轮询的同步渲染）失败时静默回滚，
+         避免 themes 目录缺失等持续故障下每 2 秒弹一次失败提示。 */
+      if (persist) toast('切换主题失败：' + e.message);
       return false;
     }
   });
