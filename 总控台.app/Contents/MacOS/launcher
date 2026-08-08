@@ -3,7 +3,7 @@ set -u
 umask 077
 
 PROJECT_DIR="$(cd "$(dirname "$0")/../../.." && pwd)"
-export PATH="/opt/anaconda3/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 show_error() {
   /usr/bin/osascript -e 'on run argv' \
