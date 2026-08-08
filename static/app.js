@@ -13,7 +13,7 @@ import { renderLaunchpad, toggleApp, closePortDiagnostic, closeAppDiagnosis } fr
 import { renderServices, observePortDiscovery,
   suspendPortDiscovery } from './js/services.js';
 import { initWidgets, renderWidgets, openLogsCenter, closeLogsCenter,
-  openSettingsCenter, closeSettingsCenter } from './js/widgets.js';
+  openSettingsCenter, closeSettingsCenter, resetFeedBaseline } from './js/widgets.js';
 import { buildGlyphGrid, initAppModal, initLogDrawer, openConfirm,
   openAppModal, closeAppModal, closeConfirm, openLogs, closeLogs,
   openConsoleLog } from './js/overlays.js';
@@ -139,7 +139,10 @@ function poll(force = false) {
         return;
       }
       reconcilePendingUiTheme(data);
-      if (state.restartingFrom) suspendPortDiscovery();
+      if (state.restartingFrom) {
+        suspendPortDiscovery();
+        resetFeedBaseline();
+      }
       observePortDiscovery(data);
       notifyTaskCompletions(state.data, data);
       state.data = data;
@@ -158,6 +161,7 @@ function poll(force = false) {
       render();
     } catch (e) {
       suspendPortDiscovery();
+      resetFeedBaseline();
       if (e && e.name !== 'AbortError') console.error('状态刷新失败', e);
       /* 页面进入后台时主动取消请求，不把它误报成断连。 */
       if (!document.hidden || timedOut) {
@@ -187,6 +191,7 @@ window.__poll = () => poll(true);   // 模块间共享轮询入口
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     suspendPortDiscovery();
+    resetFeedBaseline();
     clearTimeout(pollTimer);
     pollTimer = null;
     if (pollController) pollController.abort();

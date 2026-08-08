@@ -16,6 +16,13 @@ let feedSeq = 0;
 let feedEvents = [];
 let prevSnap = null;              // 上一份用于差异对比的快照
 
+/* 断线、页面转入后台或总控台重启后由 app.js 调用：
+   丢弃旧基线，下一份快照只重建基线，避免把断档期积压的变化
+   一次性当作“刚刚发生”的事件灌进实时动态/告警。 */
+export function resetFeedBaseline() {
+  prevSnap = null;
+}
+
 const feedListL = $('#feedListL'), feedListS = $('#feedListS');
 const topPortsL = $('#topPortsL'), topPortsS = $('#topPortsS');
 const topResS = $('#topResS'), resTabs = $('#resTabs');
