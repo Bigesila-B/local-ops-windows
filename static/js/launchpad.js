@@ -56,8 +56,14 @@ function updateCardGlow(card, app) {
 const FAVICON_RETRY_DELAYS = [5000, 15000, 60000];
 function maybeFetchFavicon(card, app) {
   const port = preferredOpenPort(app);
-  if (app.icon || app.glyph || app.favicon || !app.running || !port) {
+  if (app.icon || app.glyph || !app.running || !port) {
     if (app.favicon) card._favFetch = null;
+    return;
+  }
+  /* favicon 已就位时只在加载失败后重试（_favFailedAt 记录上次失败的地址），
+     正常显示的 favicon 不再重复请求。 */
+  if (app.favicon && card._favFailedAt !== app.favicon) {
+    card._favFetch = null;
     return;
   }
   const signature = String(app.pid || app.lastPid || port);
@@ -100,8 +106,29 @@ function createAppCard() {
     iconTxt.hidden = false;
     const app = findApp(card.dataset.key);
     setText(iconTxt, app && app.name ? [...app.name][0].toUpperCase() : '?');
+    /* favicon 已保存但图片加载失败（404/损坏）：按重试延迟再次抓取，
+       否则 app.favicon 一旦被设置就永远停在字母占位。 */
+    if (app && app.favicon && iconImg._failedSrc === app.favicon) {
+      card._favFailedAt = app.favicon;
+      const attempt = card._favFetch;
+      const signature = String(app.pid || app.lastPid || preferredOpenPort(app));
+      if (attempt && attempt.signature === signature) {
+        const delayIndex = Math.max(0, Math.min(
+          attempt.attempts - 1, FAVICON_RETRY_DELAYS.length - 1));
+        attempt.nextAt = Date.now() + FAVICON_RETRY_DELAYS[delayIndex];
+      } else {
+        card._favFetch = {
+          signature, attempts: 0,
+          nextAt: Date.now() + FAVICON_RETRY_DELAYS[0],
+          inFlight: false,
+        };
+      }
+    }
   });
-  iconImg.addEventListener('load', () => { iconImg._failedSrc = ''; });
+  iconImg.addEventListener('load', () => {
+    iconImg._failedSrc = '';
+    card._favFailedAt = '';
+  });
   const iconGlyph = el('span', 'app-icon-glyph');
   iconGlyph.hidden = true;
   const iconTxt = el('span', 'app-icon-letter');
@@ -817,8 +844,10 @@ function moveDrag(e) {
       flip(d.grid, () => d.grid.insertBefore(d.ph, ref));
     }
   } else if (over && d.grid.contains(over)) {
-    if (d.ph.nextSibling !== over) {  // 添加卡上 → 末尾
-      flip(d.grid, () => d.grid.insertBefore(d.ph, over));
+    /* 添加卡上 → 网格末尾。添加卡被 prepend 到网格首位，
+       insertBefore(d.ph, over) 会把卡片插到首位，与“末尾”意图相反。 */
+    if (d.ph !== d.grid.lastChild) {
+      flip(d.grid, () => d.grid.appendChild(d.ph));
     }
   }
 }
