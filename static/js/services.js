@@ -405,10 +405,9 @@ function createDiscoveryRow() {
   add.type = 'button';
   add.textContent = '加入启动台';
   add.addEventListener('click', () => {
-    const key = row.dataset.key;
-    openServiceAppModal(discoveryItems.get(key));
-    discoveryItems.delete(key);
-    renderPortDiscovery();
+    /* 只打开模态框，不立即移除发现项：用户取消后该项仍可再次操作；
+       创建成功且应用开始监听后，轮询清理循环会按端口归属自动移除。 */
+    openServiceAppModal(discoveryItems.get(row.dataset.key));
   });
   const ignore = el('button', 'btn port-discovery-ignore');
   ignore.type = 'button';
