@@ -106,7 +106,7 @@ input, textarea { font: inherit; color: var(--ink); }
 .ic { display: inline-flex; align-items: center; justify-content: center; flex: none; }
 .ic svg { display: block; }
 
-button:focus-visible, input:focus-visible, textarea:focus-visible, [tabindex]:focus-visible {
+button:focus-visible, input:focus-visible, textarea:focus-visible, a.icon-btn:focus-visible, [tabindex]:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring) !important;
 }
@@ -224,6 +224,7 @@ kbd {
   transition: all 0.13s ease;
 }
 .icon-btn:hover { border-color: var(--line-2); color: var(--ink); }
+a.icon-btn { text-decoration: none; }
 
 /* ---------- 主区域 ---------- */
 .main { flex: 1; min-width: 0; overflow-y: auto; overflow-x: hidden; }

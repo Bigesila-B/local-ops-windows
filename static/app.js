@@ -598,6 +598,7 @@ document.addEventListener('keydown', e => {
    ============================================================ */
 setChildren(restartConsoleIcon, icon('refresh-cw', 14));
 setChildren(stopConsoleIcon, icon('power', 14));
+setChildren($('#githubLink'), icon('github', 15));
 setChildren($('#navIconLaunch'), icon('layout-grid', 15));
 setChildren($('#navIconSvc'), icon('activity', 15));
 setChildren($('#railIconLaunch'), icon('rocket', 19));

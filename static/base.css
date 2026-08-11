@@ -455,6 +455,7 @@
   button:focus-visible,
   input:focus-visible,
   textarea:focus-visible,
+  a.icon-btn:focus-visible,
   [tabindex]:focus-visible {
     outline: 2px solid Highlight !important;
     outline-offset: 2px;
