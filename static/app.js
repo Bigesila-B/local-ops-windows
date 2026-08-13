@@ -280,7 +280,7 @@ function showConsoleActivationInfo(action) {
     title: '先启用后台控制',
     bodyHtml: '当前 <b>' + escapeHtml(consolePortLabel.textContent || '总控台') +
       '</b> 是修改前启动的旧后台，所以页面还不能直接' + escapeHtml(action) + '。' +
-      '<div class="confirm-detail">请双击项目里的 <b>总控台.app</b>，在弹窗中选择“重新启动”。只需做这一次；以后就能直接在页面里重启或停止。</div>',
+      '<div class="confirm-detail">请双击项目里的 <b>start.bat</b> 重新启动。只需做这一次；以后就能直接在页面里重启或停止。</div>',
     okText: '知道了',
     tone: 'primary',
     onOk: () => {},
@@ -320,7 +320,7 @@ restartConsoleBtn.addEventListener('click', () => {
       restartDeadlineTimer = setTimeout(() => {
         if (!state.restartingFrom) return;
         state.restartingFrom = null;
-        setConnected(false, '总控台重启超时，请双击“总控台.app”重新打开。');
+        setConnected(false, '总控台重启超时，请双击“start.bat”重新打开。');
         render();
       }, 25000);
     },
@@ -337,11 +337,11 @@ stopConsoleBtn.addEventListener('click', () => {
   openConfirm({
     title: '停止总控台',
     bodyHtml: '确定要停止总控台吗？' +
-      '<div class="confirm-detail">当前页面会断开；启动台里已经运行的应用不会被停止。再次使用时，双击“总控台.app”即可。</div>',
+      '<div class="confirm-detail">当前页面会断开；启动台里已经运行的应用不会被停止。再次使用时，双击“start.bat”即可。</div>',
     okText: '停止运行',
     onOk: async () => {
       state.stopping = true;
-      banner.textContent = '总控台正在停止…再次启动请双击“总控台.app”。';
+      banner.textContent = '总控台正在停止…再次启动请双击“start.bat”。';
       banner.classList.add('show');
       banner.setAttribute('aria-hidden', 'false');
       render();
@@ -352,13 +352,13 @@ stopConsoleBtn.addEventListener('click', () => {
         render();
         return;
       }
-      banner.textContent = '总控台已停止。再次启动请双击“总控台.app”。';
+      banner.textContent = '总控台已停止。再次启动请双击"start.bat"。';
     },
   });
 });
 
 /* ============================================================
-   命令面板（⌘K）
+   命令面板（Ctrl+K）
    ============================================================ */
 const paletteMask = $('#paletteMask'), paletteInput = $('#paletteInput');
 const paletteList = $('#paletteList');
@@ -435,7 +435,7 @@ function paletteActions() {
   items.push({
     icon: 'file-text',
     title: '打开日志中心',
-    hint: '日志 · ⌘J',
+    hint: '日志 · Ctrl+J',
     run: openLogsCenter,
   });
   items.push({
@@ -560,7 +560,7 @@ paletteInput.addEventListener('keydown', e => {
 });
 paletteMask.addEventListener('mousedown', e => { if (e.target === paletteMask) closePalette(); });
 
-/* ⌘K / Ctrl+K 呼出命令面板 */
+/* Ctrl+K 呼出命令面板 */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'k') {
     e.preventDefault();
@@ -568,7 +568,7 @@ document.addEventListener('keydown', e => {
     else if (!activeLayer()) openPalette();
   }
 });
-/* ⌘J / Ctrl+J 呼出日志中心（⌘L 是浏览器地址栏保留键，无法拦截） */
+/* Ctrl+J 呼出日志中心（Ctrl+L 是浏览器地址栏保留键，无法拦截） */
 document.addEventListener('keydown', e => {
   if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === 'j') {
     e.preventDefault();

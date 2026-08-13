@@ -11,7 +11,7 @@ permissions:
 jobs:
   check-and-release:
     name: Check and release audit
-    runs-on: macos-15
+    runs-on: windows-latest
     timeout-minutes: 20
     env:
       PYTHONDONTWRITEBYTECODE: "1"
@@ -23,24 +23,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: "3.12"
+          python-version: "3.11"
 
       - name: Show toolchain
+        shell: bash
         run: |
           python --version
           node --version
 
       - name: Run project checks
-        run: make check PYTHON=python
+        shell: bash
+        run: python tools/check_project.py
 
       - name: Build and verify release
+        shell: bash
         run: |
-          make release PYTHON=python
-          make release-verify PYTHON=python
+          python tools/build_release.py --dist dist
+          python tools/build_release.py --dist dist --verify-only
           cp dist/console-*.zip "$RUNNER_TEMP/console-first.zip"
-          make release PYTHON=python
+          python tools/build_release.py --dist dist
           cmp "$RUNNER_TEMP/console-first.zip" dist/console-*.zip
-          make release-verify PYTHON=python
+          python tools/build_release.py --dist dist --verify-only

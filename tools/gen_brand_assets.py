@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""从品牌 AppIcon 主图生成网页图标与 macOS ICNS。
+"""从品牌主图生成网页图标。
 
-依赖 Pillow（requirements-dev.txt）和 macOS 自带的 iconutil。
+依赖 Pillow（requirements-dev.txt）。
 主图必须是带透明通道的正方形 PNG，并自行包含安全留白。
 """
 
@@ -54,22 +54,23 @@ def main() -> None:
     )
 
     iconutil = shutil.which("iconutil")
-    if not iconutil:
-        raise SystemExit("找不到 macOS iconutil，无法生成 AppIcon.icns")
-    with tempfile.TemporaryDirectory(prefix="console-brand-") as tmp:
-        iconset = Path(tmp) / "AppIcon.iconset"
-        iconset.mkdir()
-        for size, name in ICONSET_SIZES:
-            resized(source, size).save(iconset / name, optimize=True)
-        subprocess.run(
-            [iconutil, "-c", "icns", str(iconset), "-o", str(ICNS)],
-            check=True,
-        )
+    if iconutil:
+        with tempfile.TemporaryDirectory(prefix="console-brand-") as tmp:
+            iconset = Path(tmp) / "AppIcon.iconset"
+            iconset.mkdir()
+            for size, name in ICONSET_SIZES:
+                resized(source, size).save(iconset / name, optimize=True)
+            subprocess.run(
+                [iconutil, "-c", "icns", str(iconset), "-o", str(ICNS)],
+                check=True,
+            )
+        print(f"已生成 {ICNS}")
+    else:
+        print("未找到 iconutil，跳过 AppIcon.icns 生成")
 
     print(f"已生成 {ASSETS / 'favicon.ico'}")
     print(f"已生成 {ASSETS / 'favicon-32.png'}")
     print(f"已生成 {ASSETS / 'apple-touch-icon.png'}")
-    print(f"已生成 {ICNS}")
 
 
 if __name__ == "__main__":

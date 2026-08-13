@@ -18,7 +18,7 @@
 
 ## 安全、隐私与素材
 
-- [ ] 没有提交 `data/`、Application Support、Library Logs、凭据、token、个人绝对路径或真实用户命令
+- [ ] 没有提交 `data/`、%APPDATA%\总控台 数据和日志目录、凭据、token、个人绝对路径或真实用户命令
 - [ ] 截图、录屏、日志和示例已经脱敏
 - [ ] 没有削弱回环绑定、写接口授权、当前 UID 或受控进程身份校验
 - [ ] 新增/替换素材已更新 `ASSET_PROVENANCE.md`；必要时同步 `THIRD_PARTY_NOTICES.md` 和许可原文
@@ -26,7 +26,7 @@
 
 ## 兼容性与回退
 
-<!-- 说明配置 schema、数据迁移、macOS/Python 要求及安全回退方式；不适用请写“无”。 -->
+<!-- 说明配置 schema、数据迁移、Windows/Python 要求及安全回退方式；不适用请写"无"。 -->
 
 ## 截图或证据
 
