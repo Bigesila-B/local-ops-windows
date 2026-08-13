@@ -38,14 +38,19 @@ export function getIconVer(id) { return iconVer.get(id) || 0; }
 
 /* 兼容尚未重启的旧后端；新后端会返回经过同样规则生成的 command。 */
 function shellQuotePath(path) {
-  return "'" + String(path).replace(/'/g, "'\"'\"'") + "'";
+  if (/["\s]/.test(path)) {
+    return '"' + String(path).replace(/"/g, '""') + '"';
+  }
+  return String(path);
 }
 function fallbackScriptCommand(path) {
   const quoted = shellQuotePath(path);
-  const suffix = (String(path).match(/(\.[^./]+)$/) || [])[1]?.toLowerCase();
-  if (suffix === '.py') return 'python3 -- ' + quoted;
-  if (suffix === '.zsh') return '/bin/zsh -- ' + quoted;
-  return '/bin/bash -- ' + quoted;
+  const suffix = (String(path).match(/(\.[^./\\]+)$/) || [])[1]?.toLowerCase();
+  if (suffix === '.py') return 'python ' + quoted;
+  if (suffix === '.ps1') return 'powershell -ExecutionPolicy Bypass -File ' + quoted;
+  if (suffix === '.bat' || suffix === '.cmd') return 'call ' + quoted;
+  if (suffix === '.zsh' || suffix === '.sh' || suffix === '.bash') return 'bash ' + quoted;
+  return quoted;
 }
 
 /* ============================================================
@@ -565,10 +570,10 @@ export function initAppModal({ onAddService, onAddTask }) {
       if (!r || r.canceled || !r.path) return;  // 取消或失败均静默
       const p = r.path;
       fCmd.value = r.command || fallbackScriptCommand(p);
-      const dir = p.slice(0, p.lastIndexOf('/'));
+      const dir = p.slice(0, Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\')));
       if (dir && !fCwd.value.trim()) fCwd.value = dir;
       if (!fName.value.trim()) {
-        const base = p.split('/').pop().replace(/\.(command|sh|bash|zsh|py)$/i, '');
+        const base = p.split(/[\\/]/).pop().replace(/\.(command|sh|bash|zsh|py|bat|cmd|ps1)$/i, '');
         if (base) fName.value = base;
       }
       fCmd.classList.remove('invalid');
@@ -583,7 +588,7 @@ export function initAppModal({ onAddService, onAddTask }) {
     }
   });
 
-  /* 浏览工作目录（macOS 原生选择框） */
+  /* 浏览工作目录（系统原生选择框） */
   btnPickCwd.addEventListener('click', async () => {
     btnPickCwd.disabled = true;
     try {
